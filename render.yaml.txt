@@ -1,0 +1,44 @@
+\
+# Render Blueprint — one-click deploy.
+# Dashboard → New → Blueprint → point at your GitHub repo containing this file.
+# Render will create the web service AND the free Postgres database below, and
+# wire DATABASE_URL between them automatically. You'll only be prompted for the
+# `sync: false` secrets (BOT_TOKEN, OWNER_ID, ANTHROPIC_API_KEY, channel/group).
+#
+# Reference: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    runtime: python
+    name: quiz-bot
+    plan: free
+    region: oregon
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python master_bot.py
+    healthCheckPath: /
+    autoDeployTrigger: commit
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: BOT_TOKEN
+        sync: false          # paste the token from @BotFather when prompted
+      - key: OWNER_ID
+        sync: false          # your numeric Telegram user ID (see @userinfobot)
+      - key: ANTHROPIC_API_KEY
+        sync: false          # optional — only needed if you want Claude as an AI provider
+      - key: AI_MODEL
+        value: claude-sonnet-5
+      - key: UPDATE_CHANNEL
+        sync: false          # e.g. @YourChannel — required-join channel, optional
+      - key: UPDATE_GROUP
+        sync: false          # e.g. @YourGroup — required-join group, optional
+      - key: DATABASE_URL
+        fromDatabase:
+          name: quiz-bot-db
+          property: connectionString
+
+databases:
+  - name: quiz-bot-db
+    plan: free
+    databaseName: quizbot
