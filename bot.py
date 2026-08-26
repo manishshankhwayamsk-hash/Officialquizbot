@@ -117,7 +117,7 @@ PROVIDER_PRESETS = {
         "label": "🔵 Google Gemini",
         "style": "gemini",
         "api_base": "https://generativelanguage.googleapis.com/v1beta",
-        "model": "gemini-2.0-flash",
+        "model": "gemini-3.6-flash",  # 👈 Yahan 'gemini-2.0-flash' ko badal kar 'gemini-3.6-flash' karein
     },
     "openai": {
         "label": "🟣 OpenAI",
@@ -134,8 +134,8 @@ PROVIDER_PRESETS = {
     "custom": {
         "label": "⚙️ Custom / Open-source",
         "style": "openai",
-        "api_base": "",   # user supplies their own base URL
-        "model": "",      # user supplies their own model name
+        "api_base": "",
+        "model": "",
     },
 }
 
