@@ -1,0 +1,6445 @@
+import os
+import re
+import csv
+import io
+import json
+import base64
+import logging
+import sqlite3
+import asyncio
+import time
+import requests
+import threading
+from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ChatPermissions,
+    Poll,
+)
+from telegram.request import HTTPXRequest
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    PollAnswerHandler,
+    ChatMemberHandler,
+    ConversationHandler,
+    ContextTypes,
+    ApplicationHandlerStop,
+    filters,
+)
+
+try:
+    import psycopg2
+    import psycopg2.extras
+except ImportError:
+    psycopg2 = None
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+try:
+    from anthropic import Anthropic
+except ImportError:
+    Anthropic = None
+
+try:
+    from youtube_transcript_api import YouTubeTranscriptApi
+except ImportError:
+    YouTubeTranscriptApi = None
+
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
+
+# ==========================================
+# ⚙️ CONFIGURATION
+# ==========================================
+# 🔐 IMPORTANT: token ab .env / environment variable se aata hai, code me kabhi mat likhna.
+# Agar tumne pehle wala hardcoded token kahin use kiya hai, use @BotFather se turant revoke karo.
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+if not BOT_TOKEN:
+    raise SystemExit(
+        "BOT_TOKEN environment variable is not set.\n"
+        "Copy .env.example to .env, fill in a NEW token from @BotFather, then run again."
+    )
+
+OWNER_ID = int(os.getenv("OWNER_ID", "123456789"))
+DB_NAME = os.getenv("DB_NAME", "quiz_bot.db")
+
+# 🐘 Optional Postgres support — set DATABASE_URL (e.g. a free Supabase / Neon / Render
+# Postgres instance) and the bot stores everything there instead of the local SQLite
+# file, so data survives redeploys/restarts on free hosts with an ephemeral disk.
+# Leave DATABASE_URL unset (e.g. running in Pydroid 3) and it keeps using SQLite exactly
+# like before — nothing else changes.
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+USE_POSTGRES = bool(DATABASE_URL) and psycopg2 is not None
+if bool(DATABASE_URL) and psycopg2 is None:
+    raise SystemExit(
+        "DATABASE_URL is set but 'psycopg2-binary' isn't installed.\n"
+        "Run: pip install psycopg2-binary"
+    )
+PK_TYPE = "SERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+# AI generation (needed for /topic, /pdf, /image, /youtube, /multi, /section)
+# This is the bot OWNER's fallback key — used for anyone who hasn't added their own
+# with /addapi. Users can bring any provider's key (Groq, Gemini, OpenAI, any
+# OpenAI-compatible open-source endpoint, or their own Anthropic key) instead.
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+AI_MODEL = os.getenv("AI_MODEL", "claude-sonnet-5")
+
+# ==========================================
+# 🔌 MULTI-PROVIDER AI CONFIG
+# ==========================================
+# Presets shown in the /addapi menu. "style" decides which HTTP call shape is used:
+#   - "anthropic": Anthropic Messages API (native image/PDF support)
+#   - "openai":    OpenAI-compatible /chat/completions (Groq, OpenAI, and any
+#                  open-source/self-hosted server — Ollama, LM Studio, vLLM,
+#                  Together, OpenRouter, etc. — text-only here)
+#   - "gemini":    Google Generative Language API (text-only here)
+PROVIDER_PRESETS = {
+    "groq": {
+        "label": "🟢 Groq",
+        "style": "openai",
+        "api_base": "https://api.groq.com/openai/v1",
+        "model": "llama-3.3-70b-versatile",
+    },
+    "gemini": {
+        "label": "🔵 Google Gemini",
+        "style": "gemini",
+        "api_base": "https://generativelanguage.googleapis.com/v1beta",
+        "model": "gemini-2.0-flash",
+    },
+    "openai": {
+        "label": "🟣 OpenAI",
+        "style": "openai",
+        "api_base": "https://api.openai.com/v1",
+        "model": "gpt-4o-mini",
+    },
+    "anthropic": {
+        "label": "🟠 Anthropic (Claude)",
+        "style": "anthropic",
+        "api_base": None,
+        "model": "claude-sonnet-5",
+    },
+    "custom": {
+        "label": "⚙️ Custom / Open-source",
+        "style": "openai",
+        "api_base": "",   # user supplies their own base URL
+        "model": "",      # user supplies their own model name
+    },
+}
+
+# Update channel & group details (Include '@' or Chat IDs)
+UPDATE_CHANNEL = os.getenv("UPDATE_CHANNEL", "@Telegram")  # Apna channel username yaha dalein
+UPDATE_GROUP = os.getenv("UPDATE_GROUP", "@Telegram")      # Apna group username yaha dalein
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Conversation states (shared range; each ConversationHandler tracks its own state independently)
+(
+    ASK_CONTENT, ASK_DIFFICULTY, ASK_LANGUAGE, ASK_COUNT, ASK_SECTION_COUNT,
+    ASK_CSV, ASK_EDIT_CHOICE, ASK_EDIT_TEXT,
+    ASK_API_PROVIDER, ASK_API_CUSTOM_BASE, ASK_API_CUSTOM_MODEL, ASK_API_KEY,
+    OQ_TITLE, OQ_TIMER, OQ_METHOD, OQ_COLLECT, OQ_BULK,
+    STORE_EDIT_TITLE, STORE_ADD_QUESTION, STORE_EDIT_TIMER, STORE_EDIT_DESC,
+    ASK_VOICE, IMPORT_COLLECT, IMPORT_KEYWORD,
+    ASK_QUIZBLAST_TEXT,
+    NEWSET_NAME, ADD_BULK_TITLE, ADD_BULK_CONTENT, SETCHANNEL_WAIT,
+) = range(29)
+
+# ==========================================
+# 🎨 STYLISH FONT HELPER
+# ==========================================
+# Har bot message ka HEADER/TITLE isi font me dikhega. Body text (instructions,
+# quiz questions, IDs, numbers) normal rehta hai taaki readable rahe.
+STYLE_MAP = {
+    'a': '𝛂', 'b': 'в', 'c': 'ς', 'd': '∂', 'e': 'є', 'f': 'ƒ', 'g': 'g',
+    'h': 'н', 'i': 'ι', 'j': 'ʝ', 'k': 'ĸ', 'l': 'ʟ', 'm': 'м', 'n': 'η',
+    'o': 'ο', 'p': 'ρ', 'q': 'q', 'r': 'ɤ', 's': '𝛅', 't': 'τ', 'u': '𝛖',
+    'v': 'ν', 'w': 'ω', 'x': 'χ', 'y': 'у', 'z': 'ᴢ',
+}
+
+
+def stylize(text: str) -> str:
+    """Convert plain text into the bot's signature stylised font."""
+    return "".join(STYLE_MAP.get(ch.lower(), ch) for ch in text)
+
+
+FONT_STYLE = stylize("your stay & let's grow together")
+
+# ==========================================
+# 💾 DATABASE CONNECTION LAYER (SQLite or Postgres)
+# ==========================================
+class _PGCursorShim:
+    """Wraps a psycopg2 cursor so all the existing sqlite-style code — '?'
+    placeholders and .lastrowid — keeps working unmodified against Postgres."""
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self.lastrowid = None
+
+    def execute(self, sql, params=()):
+        pg_sql = sql.replace("?", "%s")
+        self._cursor.execute(pg_sql, params)
+        return self
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
+class _PGConnShim:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def cursor(self):
+        return _PGCursorShim(self._conn.cursor())
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        self._conn.close()
+
+
+def db_connect():
+    """Returns a DB connection — Postgres if DATABASE_URL is set, SQLite otherwise.
+
+    SQLite: timeout=30 makes a connection WAIT (instead of instantly raising
+    "database is locked") if another thread is mid-write, and WAL journal mode lets
+    reads and writes happen concurrently — together these were a real cause of random
+    crashes under load (several handlers hitting the DB from different threads via
+    asyncio.to_thread at the same time)."""
+    if USE_POSTGRES:
+        return _PGConnShim(psycopg2.connect(DATABASE_URL, sslmode="require"))
+    conn = sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+    except sqlite3.OperationalError:
+        pass  # non-fatal — worst case we're back to the old (safe, just slower) behavior
+    return conn
+
+
+def last_insert_id(cursor, conn, table: str, pk: str = "id"):
+    """Cross-DB way to fetch the id of the row just inserted."""
+    if USE_POSTGRES:
+        cursor.execute(f"SELECT currval(pg_get_serial_sequence('{table}', '{pk}'))")
+        return cursor.fetchone()[0]
+    return cursor.lastrowid
+
+
+def upsert(cursor, table: str, keys: dict, values: dict):
+    """Cross-DB INSERT-or-REPLACE keyed on `keys` (sqlite INSERT OR REPLACE vs
+    Postgres INSERT ... ON CONFLICT DO UPDATE)."""
+    all_cols = list(keys) + list(values)
+    all_vals = list(keys.values()) + list(values.values())
+    placeholders = ", ".join(["?"] * len(all_cols))
+    if USE_POSTGRES:
+        conflict_cols = ", ".join(keys)
+        update_clause = ", ".join(f"{c}=EXCLUDED.{c}" for c in values) if values else conflict_cols
+        sql = (
+            f"INSERT INTO {table} ({', '.join(all_cols)}) VALUES ({placeholders}) "
+            f"ON CONFLICT ({conflict_cols}) DO UPDATE SET {update_clause}"
+        )
+    else:
+        sql = f"INSERT OR REPLACE INTO {table} ({', '.join(all_cols)}) VALUES ({placeholders})"
+    cursor.execute(sql, all_vals)
+
+
+# ==========================================
+# 💾 DATABASE INITIALIZATION
+# ==========================================
+def init_db():
+    conn = db_connect()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            questions_used INTEGER DEFAULT 0,
+            question_limit INTEGER DEFAULT 100,
+            referred_by INTEGER DEFAULT 0,
+            is_verified INTEGER DEFAULT 0
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS filters (
+            group_id INTEGER,
+            keyword TEXT,
+            reply TEXT,
+            PRIMARY KEY (group_id, keyword)
+        )
+    """)
+
+    cursor.execute(f"""
+        CREATE TABLE IF NOT EXISTS quizzes (
+            id {PK_TYPE},
+            user_id INTEGER,
+            title TEXT,
+            data TEXT,
+            timer_seconds INTEGER DEFAULT 0,
+            quiz_type TEXT DEFAULT 'quick',
+            creator_name TEXT DEFAULT ''
+        )
+    """)
+
+    # Groups the bot has seen — so its list of chats survives a restart even
+    # though the live-quiz session itself (pause/resume state) is in-memory.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS groups (
+            group_id INTEGER PRIMARY KEY,
+            title TEXT,
+            added_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Saved leaderboard results from finished "Official Quiz" live sessions.
+    # wrong_count / total_questions / avg_time_ms let every leaderboard (live,
+    # /topusers, /leaderboard) show real accuracy % and response speed instead of
+    # just a raw score — and user_id is always kept alongside user_name so the
+    # quiz creator can identify/contact a specific participant directly.
+    cursor.execute(f"""
+        CREATE TABLE IF NOT EXISTS quiz_results (
+            id {PK_TYPE},
+            quiz_id INTEGER,
+            chat_id INTEGER,
+            user_id INTEGER,
+            user_name TEXT,
+            score INTEGER,
+            correct_count INTEGER,
+            wrong_count INTEGER DEFAULT 0,
+            total_questions INTEGER DEFAULT 0,
+            avg_time_ms INTEGER DEFAULT 0,
+            finished_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Per-group welcome/goodbye auto-messages for new/leaving members.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS group_settings (
+            group_id INTEGER PRIMARY KEY,
+            welcome_enabled INTEGER DEFAULT 1,
+            welcome_msg TEXT DEFAULT '',
+            goodbye_msg TEXT DEFAULT ''
+        )
+    """)
+
+    # Named folders a user can file their saved quizzes into (e.g. "Class 10 History",
+    # "Weekly Current Affairs") — /newset to create, /sets to browse.
+    cursor.execute(f"""
+        CREATE TABLE IF NOT EXISTS quiz_sets (
+            id {PK_TYPE},
+            owner_id INTEGER,
+            name TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Small global key→value store for bot-wide settings the owner can tweak without a
+    # redeploy — currently just the promo message shown every 5 questions.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bot_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT DEFAULT ''
+        )
+    """)
+
+    # Channels a user has linked with /setchannel so the "📤 Send to Channel" button
+    # knows where to post — the bot must already be an admin there (a Telegram
+    # requirement, not something this bot can work around).
+    cursor.execute(f"""
+        CREATE TABLE IF NOT EXISTS user_channels (
+            id {PK_TYPE},
+            user_id INTEGER,
+            channel_id INTEGER,
+            channel_title TEXT DEFAULT ''
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS redeem_codes (
+            code TEXT PRIMARY KEY,
+            bonus_questions INTEGER,
+            max_uses INTEGER DEFAULT 0,
+            used_count INTEGER DEFAULT 0,
+            expires_at TEXT DEFAULT NULL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS redeem_uses (
+            code TEXT,
+            user_id INTEGER,
+            PRIMARY KEY (code, user_id)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS last_source (
+            user_id INTEGER PRIMARY KEY,
+            source_type TEXT,
+            parts TEXT,
+            difficulty TEXT,
+            language TEXT,
+            count INTEGER
+        )
+    """)
+
+    # Per-user "bring your own API key" — everyone can save MULTIPLE keys/providers
+    # here; everything persists in SQLite so it survives bot restarts. Generation
+    # tries them in the order added, then falls back to the owner's shared key.
+    cursor.execute(f"""
+        CREATE TABLE IF NOT EXISTS user_api_keys (
+            id {PK_TYPE},
+            user_id INTEGER,
+            provider TEXT,
+            api_key TEXT,
+            api_base TEXT,
+            model TEXT,
+            added_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Pending /schedule jobs — lets /myschedules list + cancel them, and lets a
+    # restart-orphaned row (the in-memory job itself doesn't survive a restart)
+    # get quietly swept once its run_at time has passed.
+    cursor.execute(f"""
+        CREATE TABLE IF NOT EXISTS scheduled_quizzes (
+            id {PK_TYPE},
+            user_id INTEGER,
+            chat_id INTEGER,
+            run_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+# ==========================================
+# 💾 SELF-BACKUP — Telegram itself as free, permanent off-site storage
+# ==========================================
+# Neither hosting-platform ephemeral disks nor a free DB tier's storage cap are things
+# this code can fix for you — but losing data because of them IS fixable: every table
+# gets dumped to JSON and DM'd to OWNER_ID on a schedule (and on demand via
+# /backupnow). Telegram never deletes messages in your own chat history, so that DM
+# becomes a permanent, free backup — restorable any time with /restorebackup, even
+# after switching hosts or databases entirely.
+BACKUP_TABLES = [
+    "users", "filters", "quizzes", "groups", "quiz_results",
+    "redeem_codes", "redeem_uses", "last_source", "user_api_keys", "group_settings",
+    "quiz_sets", "bot_settings", "user_channels", "scheduled_quizzes",
+]
+
+
+def export_all_tables() -> dict:
+    conn = db_connect()
+    cur = conn.cursor()
+    dump = {}
+    for table in BACKUP_TABLES:
+        cur.execute(f"SELECT * FROM {table}")
+        cols = [d[0] for d in cur.description]
+        dump[table] = [dict(zip(cols, row)) for row in cur.fetchall()]
+    conn.close()
+    return dump
+
+
+def build_backup_file() -> io.BytesIO:
+    payload = {"exported_at": datetime.utcnow().isoformat(), "tables": export_all_tables()}
+    buf = io.BytesIO(json.dumps(payload, indent=2, default=str).encode("utf-8"))
+    buf.name = f"quizbot_backup_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.json"
+    return buf
+
+
+def restore_from_backup(payload: dict) -> dict:
+    """INSERT OR REPLACE (via upsert on the primary key) every row from a backup
+    file back into the current DB — safe to run against a brand-new empty database
+    after switching providers/hosts. Returns a {table: rows_restored} summary."""
+    key_cols = {
+        "users": ["user_id"], "filters": ["group_id", "keyword"], "quizzes": ["id"],
+        "groups": ["group_id"], "quiz_results": ["id"], "redeem_codes": ["code"],
+        "redeem_uses": ["code", "user_id"], "last_source": ["user_id"], "user_api_keys": ["id"],
+        "group_settings": ["group_id"], "quiz_sets": ["id"], "bot_settings": ["key"],
+        "user_channels": ["id"],
+    }
+    conn = db_connect()
+    cur = conn.cursor()
+    summary = {}
+    for table, rows in payload.get("tables", {}).items():
+        if table not in BACKUP_TABLES or not rows:
+            summary[table] = 0
+            continue
+        keys = key_cols.get(table, [])
+        for row in rows:
+            k = {c: row[c] for c in keys if c in row}
+            v = {c: val for c, val in row.items() if c not in keys}
+            if k:
+                upsert(cur, table, k, v)
+        summary[table] = len(rows)
+    conn.commit()
+    conn.close()
+    return summary
+
+
+async def send_db_backup(bot, note: str = ""):
+    if not OWNER_ID:
+        return
+    buf = build_backup_file()
+    try:
+        await bot.send_document(
+            chat_id=OWNER_ID, document=buf, filename=buf.name,
+            caption=f"💾 Auto-backup{(' — ' + note) if note else ''}. Keep this — /restorebackup can reload it into a fresh DB any time.",
+        )
+    except Exception as e:
+        logger.warning(f"Auto-backup DM to owner failed: {e}")
+
+
+async def periodic_backup_job(context: ContextTypes.DEFAULT_TYPE):
+    await send_db_backup(context.bot)
+
+
+async def backupnow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("⛔ Owner only.")
+        return
+    await update.message.reply_text("💾 Building backup…")
+    await send_db_backup(context.bot, note="manual /backupnow")
+
+
+async def restorebackup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner only. Reply to a backup .json file (the one the bot DMs you) with
+    /restorebackup to reload every table from it — the fix after switching hosts/DBs."""
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("⛔ Owner only.")
+        return
+    doc = None
+    if update.message.reply_to_message and update.message.reply_to_message.document:
+        doc = update.message.reply_to_message.document
+    elif update.message.document:
+        doc = update.message.document
+    if not doc:
+        await update.message.reply_text("Reply to a backup .json file with /restorebackup (or attach one with the command as the caption).")
+        return
+    try:
+        tg_file = await doc.get_file()
+        raw = await tg_file.download_as_bytearray()
+        payload = json.loads(bytes(raw).decode("utf-8"))
+        summary = restore_from_backup(payload)
+        lines = "\n".join(f"• {t}: {n} row(s)" for t, n in summary.items())
+        await update.message.reply_text(f"✅ Restore complete:\n{lines}")
+    except Exception as e:
+        logger.warning(f"Restore failed: {e}")
+        await update.message.reply_text(f"❌ Restore failed — is that a valid backup file? ({e})")
+
+
+def run_migrations():
+    """Adds columns introduced after the first release to any existing DB."""
+    conn = db_connect()
+    cursor = conn.cursor()
+
+    new_columns = (
+        ("users", "tag", "TEXT DEFAULT ''"),
+        ("users", "description_tag", "TEXT DEFAULT ''"),
+        ("users", "default_difficulty", "TEXT DEFAULT ''"),
+        ("users", "default_language", "TEXT DEFAULT ''"),
+        ("users", "daily_ai_used", "INTEGER DEFAULT 0"),
+        ("users", "daily_ai_date", "TEXT DEFAULT ''"),
+        ("users", "ai_unlimited", "INTEGER DEFAULT 0"),
+        ("users", "option_style", "TEXT DEFAULT 'plain'"),
+        ("quizzes", "timer_seconds", "INTEGER DEFAULT 0"),
+        ("quizzes", "quiz_type", "TEXT DEFAULT 'quick'"),
+        ("quizzes", "creator_name", "TEXT DEFAULT ''"),
+        ("quizzes", "description", "TEXT DEFAULT ''"),
+        ("quizzes", "set_id", "INTEGER DEFAULT NULL"),
+        ("quizzes", "is_public", "INTEGER DEFAULT 0"),
+        ("redeem_codes", "expires_at", "TEXT DEFAULT NULL"),
+        ("quiz_results", "wrong_count", "INTEGER DEFAULT 0"),
+        ("quiz_results", "total_questions", "INTEGER DEFAULT 0"),
+        ("quiz_results", "avg_time_ms", "INTEGER DEFAULT 0"),
+    )
+    for table, col, coltype in new_columns:
+        if USE_POSTGRES:
+            # Postgres supports IF NOT EXISTS directly — no error, no aborted transaction.
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {coltype}")
+        else:
+            try:
+                cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
+    # Migrate user_api_keys from an earlier one-key-per-user schema (PRIMARY KEY
+    # user_id) to the current multi-key schema — only relevant for pre-existing
+    # SQLite files; a fresh Postgres DB always starts on the current schema.
+    if not USE_POSTGRES:
+        try:
+            cursor.execute("PRAGMA table_info(user_api_keys)")
+            cols = [row[1] for row in cursor.fetchall()]
+            if cols and "id" not in cols:
+                cursor.execute("ALTER TABLE user_api_keys RENAME TO user_api_keys_old")
+                cursor.execute("""
+                    CREATE TABLE user_api_keys (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER,
+                        provider TEXT,
+                        api_key TEXT,
+                        api_base TEXT,
+                        model TEXT,
+                        added_at TEXT DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                cursor.execute("""
+                    INSERT INTO user_api_keys (user_id, provider, api_key, api_base, model)
+                    SELECT user_id, provider, api_key, api_base, model FROM user_api_keys_old
+                """)
+                cursor.execute("DROP TABLE user_api_keys_old")
+        except sqlite3.OperationalError:
+            pass  # table doesn't exist yet — init_db() will create the current schema
+
+    conn.commit()
+    conn.close()
+
+
+init_db()
+run_migrations()
+
+# ==========================================
+# 🔐 DATABASE HELPERS
+# ==========================================
+def get_user(user_id: int) -> dict:
+    conn = db_connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT user_id, questions_used, question_limit, is_verified, tag, "
+        "description_tag, default_difficulty, default_language, daily_ai_used, "
+        "daily_ai_date, ai_unlimited, option_style FROM users WHERE user_id = ?",
+        (user_id,)
+    )
+    user = cursor.fetchone()
+
+    if not user:
+        cursor.execute(
+            "INSERT INTO users (user_id, questions_used, question_limit, is_verified) VALUES (?, 0, 100, 0)",
+            (user_id,)
+        )
+        conn.commit()
+        cursor.execute(
+            "SELECT user_id, questions_used, question_limit, is_verified, tag, "
+            "description_tag, default_difficulty, default_language, daily_ai_used, "
+            "daily_ai_date, ai_unlimited, option_style FROM users WHERE user_id = ?",
+            (user_id,)
+        )
+        user = cursor.fetchone()
+
+    conn.close()
+    return {
+        "user_id": user[0],
+        "questions_used": user[1],
+        "question_limit": user[2],
+        "is_verified": user[3],
+        "tag": user[4] or '',
+        "description_tag": user[5] or '',
+        "default_difficulty": user[6] or '',
+        "default_language": user[7] or '',
+        "daily_ai_used": user[8] or 0,
+        "daily_ai_date": user[9] or '',
+        "ai_unlimited": bool(user[10]),
+        "option_style": user[11] or 'plain',
+    }
+
+
+def set_verified(user_id: int, status: int = 1):
+    conn = db_connect()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET is_verified = ? WHERE user_id = ?", (status, user_id))
+    conn.commit()
+    conn.close()
+
+
+def set_user_field(user_id: int, field: str, value):
+    allowed = {"tag", "description_tag", "default_difficulty", "default_language", "referred_by", "option_style"}
+    if field not in allowed:
+        raise ValueError(f"field '{field}' is not allowlisted for update")
+    get_user(user_id)  # ensure row exists
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(f"UPDATE users SET {field} = ? WHERE user_id = ?", (value, user_id))
+    conn.commit()
+    conn.close()
+
+
+def increment_questions_used(user_id: int, n: int):
+    if n <= 0:
+        return
+    get_user(user_id)
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET questions_used = questions_used + ? WHERE user_id = ?", (n, user_id))
+    conn.commit()
+    conn.close()
+
+
+def increment_question_limit(user_id: int, n: int):
+    get_user(user_id)
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET question_limit = question_limit + ? WHERE user_id = ?", (n, user_id))
+    conn.commit()
+    conn.close()
+
+
+# ==========================================
+# 📅 DAILY AI GENERATION QUOTA (separate from the lifetime question_limit above)
+# 200 AI-generated questions/day per user, across every AI method combined
+# (topic/pdf/image/youtube/multi/section/voicequiz/importchat/regenerate) — CSV import
+# is exact-from-file, not AI, so it's never counted here. Resets automatically at UTC
+# midnight. The owner is always unlimited; anyone else can be marked unlimited too
+# (see set_ai_unlimited / /freeuser) — for friends etc.
+# ==========================================
+DAILY_AI_QUESTION_LIMIT = 200
+
+
+def get_daily_ai_remaining(user_id: int):
+    """None = unlimited (owner, or owner-granted). Otherwise the number of AI
+    questions this user can still generate today."""
+    if user_id == OWNER_ID:
+        return None
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT daily_ai_used, daily_ai_date, ai_unlimited FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return DAILY_AI_QUESTION_LIMIT
+    used, date_str, unlimited = row
+    if unlimited:
+        return None
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    used = used if date_str == today else 0
+    return max(0, DAILY_AI_QUESTION_LIMIT - (used or 0))
+
+
+def record_daily_ai_usage(user_id: int, n: int):
+    """Call AFTER generation with the actual number sent (not the number requested) —
+    mirrors how increment_questions_used() is already used elsewhere in this file."""
+    if n <= 0 or user_id == OWNER_ID:
+        return
+    get_user(user_id)
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT daily_ai_used, daily_ai_date FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    used = row[0] if row and row[1] == today else 0
+    cur.execute("UPDATE users SET daily_ai_used=?, daily_ai_date=? WHERE user_id=?", ((used or 0) + n, today, user_id))
+    conn.commit()
+    conn.close()
+
+
+def set_ai_unlimited(user_id: int, unlimited: bool):
+    get_user(user_id)  # ensure row exists
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET ai_unlimited=? WHERE user_id=?", (1 if unlimited else 0, user_id))
+    conn.commit()
+    conn.close()
+
+
+# ==========================================
+# ⚙️ BOT-WIDE SETTINGS (owner-tweakable without a redeploy) + OPTION-LABEL STYLE
+# ==========================================
+def get_bot_setting(key: str, default: str = '') -> str:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM bot_settings WHERE key=?", (key,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row and row[0] is not None else default
+
+
+def set_bot_setting(key: str, value: str):
+    conn = db_connect()
+    cur = conn.cursor()
+    upsert(cur, "bot_settings", {"key": key}, {"value": value})
+    conn.commit()
+    conn.close()
+
+
+PROMO_EVERY_N_QUESTIONS = 5
+OPTION_STYLE_LABELS = {"plain": "Plain (no prefix)", "abcd": "A) B) C) D)", "numeric": "1) 2) 3) 4)"}
+
+
+def apply_option_style(options: list, style: str) -> list:
+    style = style or 'plain'
+    if style == 'abcd':
+        return [f"{chr(65 + i)}) {o}"[:100] for i, o in enumerate(options)]
+    if style == 'numeric':
+        return [f"{i + 1}) {o}"[:100] for i, o in enumerate(options)]
+    return [o[:100] for o in options]
+
+
+async def send_promo_message(bot, chat_id):
+    promo = get_bot_setting("promo_text", "").strip()
+    if not promo:
+        return
+    try:
+        await bot.send_message(chat_id, promo)
+    except Exception as e:
+        logger.warning(f"Promo message send failed (non-fatal, quiz continues): {e}")
+
+
+# ==========================================
+# 📁 QUIZ SETS — named folders for organizing saved quizzes (e.g. by subject)
+# ==========================================
+def create_quiz_set(owner_id: int, name: str) -> int:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO quiz_sets (owner_id, name) VALUES (?, ?)", (owner_id, name[:60]))
+    conn.commit()
+    set_id = last_insert_id(cur, conn, "quiz_sets")
+    conn.close()
+    return set_id
+
+
+def get_user_sets(owner_id: int) -> list:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT id, name FROM quiz_sets WHERE owner_id=? ORDER BY id DESC", (owner_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return [{"id": r[0], "name": r[1]} for r in rows]
+
+
+def get_set_meta(set_id: int):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT id, owner_id, name FROM quiz_sets WHERE id=?", (set_id,))
+    row = cur.fetchone()
+    conn.close()
+    return {"id": row[0], "owner_id": row[1], "name": row[2]} if row else None
+
+
+def get_quizzes_in_set(set_id: int) -> list:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT id, title, quiz_type FROM quizzes WHERE set_id=? ORDER BY id DESC", (set_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return [{"id": r[0], "title": r[1], "quiz_type": r[2]} for r in rows]
+
+
+def assign_quiz_to_set(quiz_id: int, set_id):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE quizzes SET set_id=? WHERE id=?", (set_id, quiz_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_quiz_set(set_id: int, owner_id: int) -> bool:
+    """Deletes the set itself; quizzes that were filed under it are kept, just
+    unfiled (set_id reset to NULL) — deleting a folder was never asked to also
+    delete everything inside it."""
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT owner_id FROM quiz_sets WHERE id=?", (set_id,))
+    row = cur.fetchone()
+    if not row or row[0] != owner_id:
+        conn.close()
+        return False
+    cur.execute("UPDATE quizzes SET set_id=NULL WHERE set_id=?", (set_id,))
+    cur.execute("DELETE FROM quiz_sets WHERE id=?", (set_id,))
+    conn.commit()
+    conn.close()
+    return True
+
+
+# ==========================================
+# 📤 LINKED CHANNELS — for the "Send to Channel" button (bot must already be admin there)
+# ==========================================
+def add_user_channel(user_id: int, channel_id: int, channel_title: str):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM user_channels WHERE user_id=? AND channel_id=?", (user_id, channel_id))
+    if cur.fetchone():
+        conn.close()
+        return
+    cur.execute(
+        "INSERT INTO user_channels (user_id, channel_id, channel_title) VALUES (?, ?, ?)",
+        (user_id, channel_id, channel_title[:100])
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_user_channels(user_id: int) -> list:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT id, channel_id, channel_title FROM user_channels WHERE user_id=?", (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return [{"id": r[0], "channel_id": r[1], "channel_title": r[2] or str(r[1])} for r in rows]
+
+
+def remove_user_channel(user_id: int, row_id: int) -> bool:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM user_channels WHERE id=? AND user_id=?", (row_id, user_id))
+    conn.commit()
+    deleted = cur.rowcount > 0
+    conn.close()
+    return deleted
+
+
+def save_quiz(user_id: int, title: str, questions: list, timer_seconds: int = 0,
+              quiz_type: str = "quick", creator_name: str = "", description: str = "", set_id=None) -> int:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO quizzes (user_id, title, data, timer_seconds, quiz_type, creator_name, description, set_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (user_id, (title or "Quiz")[:60], json.dumps(questions), timer_seconds, quiz_type,
+         creator_name[:60], description[:200], set_id)
+    )
+    conn.commit()
+    quiz_id = last_insert_id(cur, conn, "quizzes")
+    conn.close()
+    return quiz_id
+
+
+def get_quiz_meta(quiz_id: int):
+    """Full quiz row including timer/type/creator — used by the Official Quiz flow."""
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, user_id, title, data, timer_seconds, quiz_type, creator_name, description, set_id, is_public "
+        "FROM quizzes WHERE id=?",
+        (quiz_id,)
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "id": row[0], "user_id": row[1], "title": row[2], "questions": json.loads(row[3]),
+        "timer_seconds": row[4] or 0, "quiz_type": row[5] or "quick", "creator_name": row[6] or "",
+        "description": row[7] or "", "set_id": row[8], "is_public": bool(row[9]),
+    }
+
+
+def update_quiz_description(quiz_id: int, description: str):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE quizzes SET description=? WHERE id=?", (description[:200], quiz_id))
+    conn.commit()
+    conn.close()
+
+
+def update_quiz_title(quiz_id: int, title: str):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE quizzes SET title=? WHERE id=?", (title[:60], quiz_id))
+    conn.commit()
+    conn.close()
+
+
+def update_quiz_questions(quiz_id: int, questions: list):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE quizzes SET data=? WHERE id=?", (json.dumps(questions), quiz_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_quiz(quiz_id: int, user_id: int) -> bool:
+    """Deletes a quiz, but only if it belongs to user_id — returns whether it deleted anything."""
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM quizzes WHERE id=? AND user_id=?", (quiz_id, user_id))
+    conn.commit()
+    deleted = cur.rowcount > 0
+    conn.close()
+    return deleted
+
+
+def toggle_quiz_public(quiz_id: int, user_id: int):
+    """Flips is_public for a quiz the caller owns (or the bot owner, for support).
+    Returns the new bool value, or None if the quiz doesn't exist / isn't theirs."""
+    quiz = get_quiz_meta(quiz_id)
+    if not quiz or (quiz["user_id"] != user_id and user_id != OWNER_ID):
+        return None
+    new_value = 0 if quiz["is_public"] else 1
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE quizzes SET is_public=? WHERE id=?", (new_value, quiz_id))
+    conn.commit()
+    conn.close()
+    return bool(new_value)
+
+
+def dedup_quiz_questions(quiz_id: int, user_id: int):
+    """Removes duplicate questions (by question text) within a single quiz the caller
+    owns. Returns the number removed, or None if not allowed / not found."""
+    quiz = get_quiz_meta(quiz_id)
+    if not quiz or (quiz["user_id"] != user_id and user_id != OWNER_ID):
+        return None
+    seen = set()
+    cleaned = []
+    for q in quiz["questions"]:
+        key = (q.get("question") or "").strip().lower()
+        if key not in seen:
+            seen.add(key)
+            cleaned.append(q)
+    removed = len(quiz["questions"]) - len(cleaned)
+    if removed:
+        conn = db_connect()
+        cur = conn.cursor()
+        cur.execute("UPDATE quizzes SET data=? WHERE id=?", (json.dumps(cleaned), quiz_id))
+        conn.commit()
+        conn.close()
+    return removed
+
+
+def get_public_quizzes() -> list:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, title, creator_name, timer_seconds, description FROM quizzes "
+        "WHERE is_public=1 ORDER BY id DESC"
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [
+        {"id": r[0], "title": r[1], "creator_name": r[2] or "Unknown", "timer_seconds": r[3] or 0,
+         "description": r[4] or ""}
+        for r in rows
+    ]
+
+
+def group_is_tracked(group_id: int) -> bool:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM groups WHERE group_id=?", (group_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
+
+
+def save_quiz_result(quiz_id: int, chat_id: int, user_id: int, user_name: str, score: int, correct_count: int,
+                      wrong_count: int = 0, total_questions: int = 0, avg_time_ms: int = 0):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO quiz_results (quiz_id, chat_id, user_id, user_name, score, correct_count, "
+        "wrong_count, total_questions, avg_time_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (quiz_id, chat_id, user_id, user_name[:60], score, correct_count, wrong_count, total_questions, avg_time_ms)
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_quiz_timer(quiz_id: int, timer_seconds: int):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE quizzes SET timer_seconds=? WHERE id=?", (max(0, timer_seconds), quiz_id))
+    conn.commit()
+    conn.close()
+
+
+def get_quiz_status_rows(quiz_id: int, limit: int = 200) -> list:
+    """Every finished attempt of one specific quiz — used by the 📊 Status button in
+    the Official Quiz editing section: who played it (user_id, for direct contact),
+    how many they got right/wrong, their accuracy %, and their average answer speed."""
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT user_id, user_name, score, correct_count, wrong_count, total_questions, avg_time_ms, finished_at "
+        "FROM quiz_results WHERE quiz_id=? ORDER BY score DESC, avg_time_ms ASC LIMIT ?",
+        (quiz_id, limit)
+    )
+    rows = cur.fetchall()
+    conn.close()
+    results = []
+    for r in rows:
+        correct, wrong = r[3] or 0, r[4] or 0
+        total = r[5] or (correct + wrong)
+        accuracy = round((correct / total) * 100, 1) if total else 0.0
+        results.append({
+            "user_id": r[0], "user_name": r[1] or "Unknown", "score": r[2] or 0,
+            "correct": correct, "wrong": wrong, "total": total, "accuracy": accuracy,
+            "avg_time_ms": r[6] or 0, "finished_at": r[7],
+        })
+    return results
+
+
+# ==========================================
+# 👋 GROUP WELCOME / GOODBYE SETTINGS
+# ==========================================
+DEFAULT_WELCOME_MSG = "👋 Welcome {mention} to {group}! Type /help to see what I can do."
+DEFAULT_GOODBYE_MSG = "😢 {name} left {group}. Goodbye!"
+
+
+def get_group_settings(group_id: int) -> dict:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT welcome_enabled, welcome_msg, goodbye_msg FROM group_settings WHERE group_id=?",
+        (group_id,)
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return {"enabled": True, "welcome_msg": DEFAULT_WELCOME_MSG, "goodbye_msg": DEFAULT_GOODBYE_MSG}
+    return {
+        "enabled": bool(row[0]) if row[0] is not None else True,
+        "welcome_msg": row[1] or DEFAULT_WELCOME_MSG,
+        "goodbye_msg": row[2] or DEFAULT_GOODBYE_MSG,
+    }
+
+
+def upsert_group_settings(group_id: int, **fields):
+    """Only overwrites the keys passed in — e.g. upsert_group_settings(gid, welcome_enabled=0)
+    leaves any saved welcome_msg/goodbye_msg untouched."""
+    current = get_group_settings(group_id)
+    merged = {
+        "welcome_enabled": int(fields.get("welcome_enabled", current["enabled"])),
+        "welcome_msg": fields.get("welcome_msg", current["welcome_msg"]),
+        "goodbye_msg": fields.get("goodbye_msg", current["goodbye_msg"]),
+    }
+    conn = db_connect()
+    cur = conn.cursor()
+    upsert(cur, "group_settings", {"group_id": group_id}, merged)
+    conn.commit()
+    conn.close()
+
+
+def render_welcome_template(template: str, member_name: str, member_id: int, group_title: str) -> str:
+    mention = f"[{member_name}](tg://user?id={member_id})"
+    return (
+        (template or DEFAULT_WELCOME_MSG)
+        .replace("{mention}", mention)
+        .replace("{name}", member_name)
+        .replace("{group}", group_title or "the group")
+    )[:1000]
+
+
+def track_group(group_id: int, title: str):
+    conn = db_connect()
+    cur = conn.cursor()
+    upsert(cur, "groups", {"group_id": group_id}, {"title": (title or "")[:120]})
+    conn.commit()
+    conn.close()
+
+
+async def track_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat and chat.type in ("group", "supergroup"):
+        track_group(chat.id, chat.title or "")
+
+
+def get_user_quizzes(user_id: int) -> list:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT id, title FROM quizzes WHERE user_id=? ORDER BY id DESC", (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return [{"id": r[0], "title": r[1]} for r in rows]
+
+
+def get_quiz_by_id(quiz_id: int):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT id, user_id, title, data FROM quizzes WHERE id=?", (quiz_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {"id": row[0], "user_id": row[1], "title": row[2], "questions": json.loads(row[3])}
+
+
+def update_quiz(quiz_id: int, questions: list):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE quizzes SET data=? WHERE id=?", (json.dumps(questions), quiz_id))
+    conn.commit()
+    conn.close()
+
+
+def save_last_source(user_id: int, source_type: str, parts: list, difficulty: str, language: str, count: int):
+    conn = db_connect()
+    cur = conn.cursor()
+    upsert(
+        cur, "last_source", {"user_id": user_id},
+        {"source_type": source_type, "parts": json.dumps(parts), "difficulty": difficulty,
+         "language": language, "count": count}
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_last_source(user_id: int):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT source_type, parts, difficulty, language, count FROM last_source WHERE user_id=?",
+        (user_id,)
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {"source_type": row[0], "parts": json.loads(row[1]), "difficulty": row[2], "language": row[3], "count": row[4]}
+
+
+def redeem_code(user_id: int, code: str) -> str:
+    get_user(user_id)
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT bonus_questions, max_uses, used_count, expires_at FROM redeem_codes WHERE code = ?", (code,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return "❌ Invalid code."
+    bonus, max_uses, used_count, expires_at = row
+    if expires_at and datetime.utcnow() > datetime.fromisoformat(expires_at):
+        conn.close()
+        return "❌ This code has expired."
+    if max_uses and used_count >= max_uses:
+        conn.close()
+        return "❌ This code has already been fully used."
+    cur.execute("SELECT 1 FROM redeem_uses WHERE code=? AND user_id=?", (code, user_id))
+    if cur.fetchone():
+        conn.close()
+        return "❌ You've already redeemed this code."
+    cur.execute("UPDATE users SET question_limit = question_limit + ? WHERE user_id = ?", (bonus, user_id))
+    cur.execute("UPDATE redeem_codes SET used_count = used_count + 1 WHERE code = ?", (code,))
+    cur.execute("INSERT INTO redeem_uses (code, user_id) VALUES (?, ?)", (code, user_id))
+    conn.commit()
+    conn.close()
+    return f"✅ Redeemed! +{bonus} questions added to your quota."
+
+
+def add_group_filter(group_id: int, keyword: str, reply: str):
+    conn = db_connect()
+    cur = conn.cursor()
+    upsert(cur, "filters", {"group_id": group_id, "keyword": keyword}, {"reply": reply})
+    conn.commit()
+    conn.close()
+
+
+def remove_group_filter(group_id: int, keyword: str):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM filters WHERE group_id=? AND keyword=?", (group_id, keyword))
+    conn.commit()
+    conn.close()
+
+
+def list_group_filters(group_id: int) -> list:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT keyword, reply FROM filters WHERE group_id=?", (group_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+# ==========================================
+# 🔑 PER-USER API KEY HELPERS (SQLite-backed, persists across restarts)
+# Each user can save MULTIPLE keys/providers — generation tries them in the
+# order added, then always falls back to the owner's shared key at the end.
+# ==========================================
+def add_user_api_key(user_id: int, provider: str, api_key: str, api_base: str, model: str):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO user_api_keys (user_id, provider, api_key, api_base, model) VALUES (?, ?, ?, ?, ?)",
+        (user_id, provider, api_key, api_base, model)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_user_api_keys(user_id: int) -> list:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, provider, api_key, api_base, model FROM user_api_keys WHERE user_id=? ORDER BY id",
+        (user_id,)
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [{"id": r[0], "provider": r[1], "api_key": r[2], "api_base": r[3], "model": r[4]} for r in rows]
+
+
+def delete_user_api_key_by_id(user_id: int, key_id: int):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM user_api_keys WHERE user_id=? AND id=?", (user_id, key_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_all_user_api_keys(user_id: int):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM user_api_keys WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def mask_key(key: str) -> str:
+    if not key:
+        return "(none)"
+    if len(key) <= 8:
+        return "•" * len(key)
+    return f"{key[:4]}{'•' * 6}{key[-4:]}"
+
+
+def build_provider_chain(user_id: int) -> list:
+    """
+    The ordered list of providers to try for this user: their own saved keys
+    first (in the order they added them with /addapi), then the bot owner's
+    ANTHROPIC_API_KEY as the guaranteed final fallback — so generation keeps
+    working ("meri wali to run kregi") no matter how many keys a user has
+    added, or whether they've added any at all.
+    """
+    chain = []
+    for saved in get_user_api_keys(user_id):
+        preset = PROVIDER_PRESETS.get(saved["provider"], {})
+        chain.append({
+            "provider": saved["provider"],
+            "api_key": saved["api_key"],
+            "api_base": saved["api_base"] or preset.get("api_base"),
+            "model": saved["model"] or preset.get("model"),
+            "label": preset.get("label", saved["provider"]),
+        })
+    if ANTHROPIC_API_KEY:
+        chain.append({
+            "provider": "anthropic",
+            "api_key": ANTHROPIC_API_KEY,
+            "api_base": None,
+            "model": AI_MODEL,
+            "label": "Owner's default (Anthropic)",
+        })
+    return chain
+
+
+# ==========================================
+# 🎨 KEYBOARD BUILDERS
+# ==========================================
+def verification_keyboard():
+    channel_url = f"https://t.me/{UPDATE_CHANNEL.replace('@', '')}"
+    group_url = f"https://t.me/{UPDATE_GROUP.replace('@', '')}"
+
+    keyboard = [
+        [InlineKeyboardButton("📢 Join Update Channel", url=channel_url)],
+        [InlineKeyboardButton("💬 Join Support Group", url=group_url)],
+        [InlineKeyboardButton("✅ I Am Verified", callback_data="check_verification")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def main_welcome_keyboard():
+    keyboard = [
+        [
+            InlineKeyboardButton("🛠️ Tools", callback_data="open_tools"),
+            InlineKeyboardButton("ℹ️ Help", callback_data="open_help")
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def tools_menu_keyboard():
+    keyboard = [
+        [
+            InlineKeyboardButton("🧠 Topic MCQ", callback_data="create_topic"),
+            InlineKeyboardButton("📄 PDF MCQ", callback_data="create_pdf")
+        ],
+        [
+            InlineKeyboardButton("📊 CSV MCQ", callback_data="create_csv"),
+            InlineKeyboardButton("🖼 Image MCQ", callback_data="create_image")
+        ],
+        [
+            InlineKeyboardButton("▶️ YouTube MCQ", callback_data="create_yt"),
+            InlineKeyboardButton("🔄 Poll → Quiz", callback_data="create_poll_clean")
+        ],
+        [
+            InlineKeyboardButton("📋 Poll → Text", callback_data="polltxt_start"),
+            InlineKeyboardButton("🧩 Multi Source", callback_data="create_multi")
+        ],
+        [
+            InlineKeyboardButton("🎙️ Voice → Quiz", callback_data="create_voice"),
+            InlineKeyboardButton("📥 Import Channel/Group", callback_data="create_import")
+        ],
+        [
+            InlineKeyboardButton("⚙️ Customize", callback_data="menu_customize")
+        ],
+        [
+            InlineKeyboardButton("♻️ Regenerate", callback_data="act_regenerate"),
+            InlineKeyboardButton("🤖 Official Quiz Bot", callback_data="menu_official")
+        ],
+        [
+            InlineKeyboardButton("🛡️ Group Management", callback_data="menu_group"),
+            InlineKeyboardButton("📚 My Store", callback_data="menu_store")
+        ],
+        [
+            InlineKeyboardButton("🌐 Public Store", callback_data="menu_publicstore")
+        ],
+        [
+            InlineKeyboardButton("🔑 Add API Key", callback_data="menu_apikey")
+        ],
+        [
+            InlineKeyboardButton("🔙 Back to Main Menu", callback_data="menu_main")
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def back_to_tools_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Tools", callback_data="open_tools")]])
+
+
+def build_welcome_text(user_name: str, user_data: dict, verified_banner: bool = False) -> str:
+    if verified_banner:
+        icon, title = "✅", stylize("Verification Successful") + "!"
+    else:
+        icon, title = "✨", stylize("Welcome") + f", {user_name}!"
+    lines = [
+        f"{icon} **{title}**",
+        f"_{FONT_STYLE}_",
+        "",
+        f"👤 **User ID:** `{user_data['user_id']}`",
+        f"📊 **Questions Quota:** {user_data['questions_used']}/{user_data['question_limit']}",
+        f"✅ **Status:** Verified User",
+        "",
+        "Click **🛠️ Tools** below to access all quiz creation & group features!",
+    ]
+    return "\n".join(lines)
+
+
+# ==========================================
+# 🤖 AI GENERATION CORE
+# ==========================================
+class ProviderError(RuntimeError):
+    """Raised by a single provider call. `is_quota=True` means the provider itself
+    refused because a rate-limit/quota/credit ceiling was hit — used to build a clear
+    "API key ki limit khatam ho gayi hai" message instead of a generic failure."""
+    def __init__(self, message: str, is_quota: bool = False, status_code: int = None):
+        super().__init__(message)
+        self.is_quota = is_quota
+        self.status_code = status_code
+
+
+_QUOTA_SIGNALS = (
+    "rate limit", "rate_limit", "ratelimit", "429", "quota", "insufficient_quota",
+    "resource_exhausted", "resource exhausted", "billing", "credit balance",
+    "too many requests", "exceeded your current quota", "plan and billing",
+)
+_AUTH_SIGNALS = (
+    "invalid api key", "invalid_api_key", "unauthorized", "401", "incorrect api key",
+    "authentication", "permission_denied", "api key not valid",
+)
+
+
+def _looks_like_quota_error(text: str, exc: Exception = None, status_code: int = None) -> bool:
+    if status_code == 429:
+        return True
+    if exc is not None and exc.__class__.__name__ == "RateLimitError":
+        return True
+    t = (text or "").lower()
+    return any(sig in t for sig in _QUOTA_SIGNALS)
+
+
+def _looks_like_auth_error(text: str, status_code: int = None) -> bool:
+    if status_code in (401, 403):
+        return True
+    t = (text or "").lower()
+    return any(sig in t for sig in _AUTH_SIGNALS)
+
+
+def _friendly_provider_message(raw: str, is_quota: bool, is_auth: bool) -> str:
+    if is_quota:
+        return "iski API key ki limit/quota khatam ho gayi hai"
+    if is_auth:
+        return "iski API key invalid/expired hai"
+    return raw[:200]
+
+
+def _build_system_prompt(count: int, difficulty: str, language: str) -> str:
+    return (
+        "You are an expert quiz writer. Read the supplied source material and write "
+        f"exactly {count} multiple-choice questions at {difficulty} difficulty, written in {language}. "
+        "Respond with ONLY a JSON array — no markdown fences, no commentary before or after. "
+        "Each array item must be an object with exactly these keys: "
+        '"question" (string), "options" (array of exactly 4 short strings), '
+        '"correct_index" (integer 0-3, the index of the correct option), '
+        '"explanation" (short string under 150 characters explaining the answer).'
+    )
+
+
+def _clean_questions(raw_questions) -> list:
+    cleaned = []
+    for q in raw_questions:
+        try:
+            options = [str(o)[:100] for o in q["options"]][:4]
+            if len(options) < 2:
+                continue
+            correct_index = int(q["correct_index"])
+            if not (0 <= correct_index < len(options)):
+                correct_index = 0
+            cleaned.append({
+                "question": str(q["question"])[:290],
+                "options": options,
+                "correct_index": correct_index,
+                "explanation": str(q.get("explanation", ""))[:195],
+            })
+        except (KeyError, ValueError, TypeError):
+            continue
+    if not cleaned:
+        raise RuntimeError("No valid questions came back — try again or use a longer source.")
+    return cleaned
+
+
+def _parse_json_questions(raw_text: str) -> list:
+    raw_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text.strip())
+    m = re.search(r"\[.*\]", raw_text, re.DOTALL)
+    if m:
+        raw_text = m.group(0)
+    try:
+        raw_questions = json.loads(raw_text)
+    except json.JSONDecodeError:
+        logger.error(f"Bad AI JSON output: {raw_text[:500]}")
+        raise RuntimeError("The AI response couldn't be parsed — please try again.")
+    return _clean_questions(raw_questions)
+
+
+def _extract_pdf_text(b64_data: str) -> str:
+    """Text-extraction fallback for providers that can't read a raw PDF file
+    (used by the OpenAI-compatible path — Groq/OpenAI/custom servers)."""
+    if not PdfReader:
+        raise RuntimeError("PDF text extraction isn't installed on the server (pip install pypdf).")
+    try:
+        raw = base64.b64decode(b64_data)
+        reader = PdfReader(io.BytesIO(raw))
+        text = "\n".join((page.extract_text() or "") for page in reader.pages)
+    except Exception as e:
+        raise RuntimeError(f"Couldn't read that PDF: {e}")
+    if not text.strip():
+        raise RuntimeError("Couldn't extract any text from that PDF (likely scanned/image-only).")
+    return text[:15000]
+
+
+def _generate_via_anthropic(api_key, model, source_parts, count, difficulty, language) -> list:
+    """Native support for text, images, and PDFs (Claude reads files directly)."""
+    if not (Anthropic and api_key):
+        raise ProviderError("No Anthropic key available for this step.", is_quota=False)
+    client = Anthropic(api_key=api_key)
+    try:
+        response = client.messages.create(
+            model=model or AI_MODEL,
+            max_tokens=4096,
+            system=_build_system_prompt(count, difficulty, language),
+            messages=[{"role": "user", "content": source_parts}],
+        )
+    except Exception as e:
+        status_code = getattr(e, "status_code", None)
+        is_quota = _looks_like_quota_error(str(e), exc=e, status_code=status_code)
+        is_auth = _looks_like_auth_error(str(e), status_code=status_code)
+        logger.error(f"Anthropic call failed: {e}")
+        raise ProviderError(_friendly_provider_message(str(e), is_quota, is_auth), is_quota=is_quota, status_code=status_code)
+    raw_text = "".join(b.text for b in response.content if getattr(b, "type", None) == "text").strip()
+    return _parse_json_questions(raw_text)
+
+
+def _build_openai_style_content(source_parts: list) -> list:
+    """Builds an OpenAI-vision-style content list: text stays text, images go in
+    as base64 data URIs (works for vision-capable models on OpenAI/Groq/most
+    self-hosted servers), and PDFs are text-extracted locally since chat-completions
+    endpoints generally can't take a raw PDF file."""
+    content = []
+    for p in source_parts:
+        t = p.get("type")
+        if t == "text":
+            content.append({"type": "text", "text": p["text"][:15000]})
+        elif t == "image":
+            media_type = p["source"]["media_type"]
+            data = p["source"]["data"]
+            content.append({"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{data}"}})
+        elif t == "document":
+            content.append({"type": "text", "text": _extract_pdf_text(p["source"]["data"])})
+    if not content:
+        raise RuntimeError("No readable content found in the source.")
+    return content
+
+
+def _generate_via_openai_compatible(api_key, api_base, model, source_parts, count, difficulty, language) -> list:
+    """Works for Groq, OpenAI, and any self-hosted / open-source OpenAI-compatible
+    server (Ollama, LM Studio, vLLM, Together, OpenRouter, etc). Images are sent
+    as vision content if the chosen model supports it; PDFs are text-extracted."""
+    if not api_base or not model:
+        raise ProviderError("This provider isn't fully configured — use /addapi to set it up again.", is_quota=False)
+    content_blocks = _build_openai_style_content(source_parts)
+    # Send a plain string when it's just one text block — friendlier to strict/older servers.
+    message_content = content_blocks[0]["text"] if (len(content_blocks) == 1 and content_blocks[0]["type"] == "text") else content_blocks
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _build_system_prompt(count, difficulty, language)},
+            {"role": "user", "content": message_content},
+        ],
+        "temperature": 0.7,
+    }
+    resp = None
+    try:
+        resp = requests.post(f"{api_base.rstrip('/')}/chat/completions", headers=headers, json=body, timeout=90)
+        resp.raise_for_status()
+        data = resp.json()
+        raw_text = data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        status_code = resp.status_code if resp is not None else None
+        body_text = resp.text[:300] if resp is not None else str(e)
+        is_quota = _looks_like_quota_error(body_text, status_code=status_code)
+        is_auth = _looks_like_auth_error(body_text, status_code=status_code)
+        logger.error(f"OpenAI-compatible call failed ({status_code}): {body_text}")
+        raise ProviderError(_friendly_provider_message(body_text, is_quota, is_auth), is_quota=is_quota, status_code=status_code)
+    return _parse_json_questions(raw_text)
+
+
+def _build_gemini_parts(source_parts: list) -> list:
+    """Gemini natively accepts inline images AND PDFs via inline_data, so both
+    work directly here without any local extraction."""
+    parts = []
+    for p in source_parts:
+        t = p.get("type")
+        if t == "text":
+            parts.append({"text": p["text"][:15000]})
+        elif t == "image":
+            parts.append({"inline_data": {"mime_type": p["source"]["media_type"], "data": p["source"]["data"]}})
+        elif t == "document":
+            parts.append({"inline_data": {"mime_type": "application/pdf", "data": p["source"]["data"]}})
+    if not parts:
+        raise RuntimeError("No readable content found in the source.")
+    return parts
+
+
+def _generate_via_gemini(api_key, model, source_parts, count, difficulty, language) -> list:
+    if not api_key:
+        raise ProviderError("No Gemini key available for this step.", is_quota=False)
+    parts = [{"text": _build_system_prompt(count, difficulty, language)}] + _build_gemini_parts(source_parts)
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    body = {"contents": [{"parts": parts}]}
+    resp = None
+    try:
+        resp = requests.post(url, json=body, timeout=90)
+        resp.raise_for_status()
+        data = resp.json()
+        raw_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except Exception as e:
+        status_code = resp.status_code if resp is not None else None
+        body_text = resp.text[:300] if resp is not None else str(e)
+        is_quota = _looks_like_quota_error(body_text, status_code=status_code)
+        is_auth = _looks_like_auth_error(body_text, status_code=status_code)
+        logger.error(f"Gemini call failed ({status_code}): {body_text}")
+        raise ProviderError(_friendly_provider_message(body_text, is_quota, is_auth), is_quota=is_quota, status_code=status_code)
+    return _parse_json_questions(raw_text)
+
+
+def generate_mcqs_sync(user_id: int, source_parts: list, count: int, difficulty: str, language: str) -> list:
+    """
+    Synchronous helper — call via asyncio.to_thread from async handlers so the
+    event loop isn't blocked while waiting on the AI API.
+
+    Tries EVERY key the user has saved with /addapi, in the order they added
+    them (Groq, Gemini, OpenAI, Anthropic, any open-source/custom endpoint —
+    any mix, any count), and if one fails (bad key, model can't handle an
+    image, provider is down, etc.) it automatically moves on to the next one.
+    The bot owner's ANTHROPIC_API_KEY is always appended as the last, guaranteed
+    fallback — so generation keeps working for every user whether or not they've
+    added a key of their own.
+
+    source_parts: list of Anthropic-style content blocks (text / image / document).
+    Returns a list of {"question","options","correct_index","explanation"} dicts.
+    Raises RuntimeError (with every provider's failure reason) only if the whole chain fails.
+    """
+    count = max(1, min(count, 25))
+    chain = build_provider_chain(user_id)
+    if not chain:
+        raise RuntimeError(
+            "⚠️ Koi AI key available nahi hai. /addapi se apni key add karo, ya bot owner se "
+            "ANTHROPIC_API_KEY set karne ko bolo."
+        )
+
+    errors = []       # list of (label, message, is_quota)
+    any_non_quota = False
+    for cand in chain:
+        try:
+            if cand["provider"] == "anthropic":
+                return _generate_via_anthropic(cand["api_key"], cand["model"], source_parts, count, difficulty, language)
+            elif cand["provider"] == "gemini":
+                return _generate_via_gemini(cand["api_key"], cand["model"], source_parts, count, difficulty, language)
+            else:
+                return _generate_via_openai_compatible(cand["api_key"], cand["api_base"], cand["model"], source_parts, count, difficulty, language)
+        except ProviderError as e:
+            logger.warning(f"Provider '{cand['label']}' failed for user {user_id} (quota={e.is_quota}): {e}")
+            errors.append((cand["label"], str(e), e.is_quota))
+            if not e.is_quota:
+                any_non_quota = True
+            continue
+        except RuntimeError as e:
+            # Non-provider failure (bad JSON from the model, unreadable PDF, empty
+            # source, etc.) — never a quota/limit issue, so it must not be reported as one.
+            logger.warning(f"Provider '{cand['label']}' failed for user {user_id} (non-quota): {e}")
+            errors.append((cand["label"], str(e), False))
+            any_non_quota = True
+            continue
+
+    if errors and not any_non_quota:
+        # Every single provider in the chain failed specifically because of a
+        # rate-limit/quota/credit ceiling — say so directly instead of a vague error,
+        # and do NOT let it fall through to "generating questions" afterwards.
+        lines = "\n".join(f"• {label}" for label, _, _ in errors)
+        raise RuntimeError(
+            "⚠️ **API key(s) ki limit/quota khatam ho gayi hai** — isliye poll/questions nahi ban paaye:\n"
+            f"{lines}\n\n"
+            "/addapi se nayi/dusri key add karo, ya thodi der (ya agle billing cycle) baad try karo."
+        )
+
+    lines = "\n".join(f"• {label}: {msg}" for label, msg, _ in errors)
+    raise RuntimeError(f"⚠️ Question generate nahi ho paaye, har provider me problem aayi:\n{lines}")
+
+
+# ==========================================
+# 🎙️ VOICE → QUIZ (speak the topic + how many questions, bot transcribes & builds it)
+# ==========================================
+def _transcribe_via_openai_whisper(api_key, api_base, model_hint, audio_bytes: bytes) -> str:
+    """Groq/OpenAI-compatible /audio/transcriptions (Whisper) endpoint. Works for Groq
+    (whisper-large-v3) and OpenAI (whisper-1); most self-hosted servers that mirror the
+    OpenAI API also expose this route."""
+    if not api_base:
+        raise ProviderError("This provider isn't fully configured for audio.", is_quota=False)
+    whisper_model = "whisper-1"
+    if "groq" in api_base:
+        whisper_model = "whisper-large-v3"
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    files = {"file": ("voice.ogg", audio_bytes, "audio/ogg")}
+    data = {"model": whisper_model}
+    resp = None
+    try:
+        resp = requests.post(f"{api_base.rstrip('/')}/audio/transcriptions", headers=headers, files=files, data=data, timeout=60)
+        resp.raise_for_status()
+        text = resp.json().get("text", "").strip()
+    except Exception as e:
+        status_code = resp.status_code if resp is not None else None
+        body_text = resp.text[:300] if resp is not None else str(e)
+        is_quota = _looks_like_quota_error(body_text, status_code=status_code)
+        is_auth = _looks_like_auth_error(body_text, status_code=status_code)
+        logger.error(f"Whisper transcription failed ({status_code}): {body_text}")
+        raise ProviderError(_friendly_provider_message(body_text, is_quota, is_auth), is_quota=is_quota, status_code=status_code)
+    if not text:
+        raise ProviderError("Audio se koi text nahi mila — dobara, thoda saaf bolke try karo.", is_quota=False)
+    return text
+
+
+def _transcribe_via_gemini(api_key, model, audio_bytes: bytes) -> str:
+    """Gemini accepts inline audio and can transcribe directly — no separate ASR endpoint needed."""
+    if not api_key:
+        raise ProviderError("No Gemini key available for this step.", is_quota=False)
+    b64 = base64.b64encode(audio_bytes).decode()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    body = {
+        "contents": [{"parts": [
+            {"text": "Transcribe this audio exactly, in whatever language is spoken. Reply with ONLY the transcript text, nothing else."},
+            {"inline_data": {"mime_type": "audio/ogg", "data": b64}},
+        ]}]
+    }
+    resp = None
+    try:
+        resp = requests.post(url, json=body, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except Exception as e:
+        status_code = resp.status_code if resp is not None else None
+        body_text = resp.text[:300] if resp is not None else str(e)
+        is_quota = _looks_like_quota_error(body_text, status_code=status_code)
+        is_auth = _looks_like_auth_error(body_text, status_code=status_code)
+        logger.error(f"Gemini transcription failed ({status_code}): {body_text}")
+        raise ProviderError(_friendly_provider_message(body_text, is_quota, is_auth), is_quota=is_quota, status_code=status_code)
+    if not text:
+        raise ProviderError("Audio se koi text nahi mila — dobara, thoda saaf bolke try karo.", is_quota=False)
+    return text
+
+
+def transcribe_voice_sync(user_id: int, audio_bytes: bytes) -> str:
+    """Tries every saved key that can actually do audio (Groq/OpenAI/custom via Whisper,
+    or Gemini natively) in the user's saved order, then the owner's fallback key if it's
+    Gemini-capable. Anthropic has no audio support so it's skipped, not counted as a failure."""
+    chain = build_provider_chain(user_id)
+    audio_capable = [c for c in chain if c["provider"] in ("groq", "openai", "custom", "gemini")]
+    if not audio_capable:
+        raise RuntimeError(
+            "⚠️ Voice samajhne ke liye Groq, OpenAI, ya Gemini API key chahiye (Anthropic audio support nahi karta). "
+            "/addapi se ek add karo."
+        )
+
+    errors = []
+    any_non_quota = False
+    for cand in audio_capable:
+        try:
+            if cand["provider"] == "gemini":
+                return _transcribe_via_gemini(cand["api_key"], cand["model"], audio_bytes)
+            else:
+                return _transcribe_via_openai_whisper(cand["api_key"], cand["api_base"], cand["model"], audio_bytes)
+        except ProviderError as e:
+            errors.append((cand["label"], str(e), e.is_quota))
+            if not e.is_quota:
+                any_non_quota = True
+            continue
+
+    if errors and not any_non_quota:
+        lines = "\n".join(f"• {label}" for label, _, _ in errors)
+        raise RuntimeError(f"⚠️ **API key(s) ki limit/quota khatam ho gayi hai** — voice samajh nahi paya:\n{lines}")
+    lines = "\n".join(f"• {label}: {msg}" for label, msg, _ in errors)
+    raise RuntimeError(f"⚠️ Voice samajh nahi paya, har provider me problem aayi:\n{lines}")
+
+
+_VOICE_NUM_WORDS = {
+    'ek': 1, 'one': 1, 'do': 2, 'two': 2, 'teen': 3, 'three': 3, 'char': 4, 'chaar': 4, 'four': 4,
+    'paanch': 5, 'panch': 5, 'five': 5, 'chhe': 6, 'chhah': 6, 'six': 6, 'saat': 7, 'seven': 7,
+    'aath': 8, 'eight': 8, 'nau': 9, 'nine': 9, 'das': 10, 'dus': 10, 'ten': 10,
+    'pandrah': 15, 'fifteen': 15, 'bees': 20, 'twenty': 20, 'pachees': 25, 'twenty-five': 25,
+}
+_VOICE_FILLER_RE = re.compile(
+    r'\b(sawal|sawaal|question|questions|quiz|banao|bana\s*do|bnao|bnado|banaiye|banana|mcq|mcqs|'
+    r'ke|ka|ki|pe|par|se|topic|please|plz|kripya)\b', re.IGNORECASE
+)
+
+
+def parse_voice_command(transcript: str):
+    """Best-effort extraction of (topic, count) from a spoken sentence like
+    'science ke 10 sawal banao' or 'make 5 questions on history'. Falls back to a
+    default of 10 questions if no number is heard, and returns the leftover text
+    (filler words stripped) as the topic."""
+    t = transcript.strip()
+    count = 10
+    m = re.search(r'\b(\d{1,3})\b', t)
+    if m:
+        count = max(1, min(int(m.group(1)), 25))
+        t = t[:m.start()] + " " + t[m.end():]
+    else:
+        for word, val in _VOICE_NUM_WORDS.items():
+            wm = re.search(rf'\b{re.escape(word)}\b', t, re.IGNORECASE)
+            if wm:
+                count = val
+                t = t[:wm.start()] + " " + t[wm.end():]
+                break
+    topic = _VOICE_FILLER_RE.sub(' ', t)
+    topic = re.sub(r'\s{2,}', ' ', topic).strip(" ,.!?-")
+    return topic, count
+
+
+async def post_quiz_polls(bot, chat_id, questions: list, user_tag: str = '', explanation_tag: str = '', option_style: str = 'plain') -> int:
+    sent = 0
+    for q in questions:
+        question_text = q["question"]
+        if user_tag:
+            question_text = f"{question_text}\n\n🏷 {user_tag}"
+        question_text = question_text[:300]
+
+        explanation = q.get("explanation", "")
+        if explanation_tag:
+            explanation = f"{explanation}\n\n💡 {explanation_tag}".strip() if explanation else f"💡 {explanation_tag}"
+        explanation = explanation[:200] or None
+
+        try:
+            await bot.send_poll(
+                chat_id=chat_id,
+                question=question_text,
+                options=apply_option_style(q["options"], option_style),
+                type=Poll.QUIZ,
+                correct_option_id=q["correct_index"],
+                explanation=explanation,
+                is_anonymous=False,
+            )
+            sent += 1
+        except Exception as e:
+            logger.warning(f"Failed to send a poll: {e}")
+
+        # A promo message every 5 questions, mid-quiz only (never trailing after the
+        # very last one) — applies no matter which tool made the quiz (AI or Official).
+        if sent and sent % PROMO_EVERY_N_QUESTIONS == 0 and sent < len(questions):
+            await send_promo_message(bot, chat_id)
+    return sent
+
+
+def extract_video_id(text: str) -> str:
+    text = text.strip()
+    patterns = [r"(?:v=|/)([0-9A-Za-z_-]{11}).*", r"youtu\.be/([0-9A-Za-z_-]{11})"]
+    for p in patterns:
+        m = re.search(p, text)
+        if m:
+            return m.group(1)
+    if re.fullmatch(r"[0-9A-Za-z_-]{11}", text):
+        return text
+    raise ValueError("couldn't parse a video ID from that link")
+
+
+def get_youtube_transcript(url_or_id: str) -> str:
+    if not YouTubeTranscriptApi:
+        raise RuntimeError("YouTube support isn't installed (pip install youtube-transcript-api).")
+    video_id = extract_video_id(url_or_id)
+    # youtube-transcript-api v1+ dropped the old static get_transcript() classmethod —
+    # current API is instance-based. .to_raw_data() gives back the same list-of-dicts
+    # shape the old API returned, so the rest of this stays unchanged.
+    fetched = YouTubeTranscriptApi().fetch(video_id)
+    return " ".join(seg["text"] for seg in fetched.to_raw_data())
+
+
+# ==========================================
+# 🔐 VERIFICATION LOGIC
+# ==========================================
+async def check_user_membership(bot, user_id: int) -> bool:
+    """Live-checks membership in UPDATE_CHANNEL and UPDATE_GROUP via the bot's own
+    get_chat_member call. This ONLY works if the bot is an admin in both chats —
+    that's a Telegram requirement, not a bug here.
+
+    Fail-CLOSED: if the check can't be completed (bot isn't admin yet, the
+    UPDATE_CHANNEL/UPDATE_GROUP value is wrong, or the user genuinely never joined —
+    Telegram raises the same kind of error for "not a member" as it does for "bot
+    can't see this chat"), we do NOT treat that as verified. Make the bot an admin in
+    both chats and double-check the .env values if everyone is getting blocked."""
+    if user_id == OWNER_ID:
+        return True
+    try:
+        member_ch = await bot.get_chat_member(chat_id=UPDATE_CHANNEL, user_id=user_id)
+        member_gr = await bot.get_chat_member(chat_id=UPDATE_GROUP, user_id=user_id)
+    except Exception as e:
+        logger.warning(f"Verification check failed for user {user_id}: {e}")
+        return False
+    valid_statuses = ('creator', 'administrator', 'member')
+    return member_ch.status in valid_statuses and member_gr.status in valid_statuses
+
+
+async def require_verification(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Gate used before commands run. Trusts the cached DB flag when it's already 1
+    (fast path — avoids 2 Telegram API calls per message), but re-checks live and
+    self-heals the flag when it's 0, so a user who rejoined doesn't have to remember
+    to tap the "I Am Verified" button again. Sends the join prompt and returns False
+    when the person still isn't verified."""
+    user = update.effective_user
+    if not user or user.id == OWNER_ID:
+        return True
+    user_data = get_user(user.id)
+    if user_data['is_verified']:
+        return True
+    if await check_user_membership(context.bot, user.id):
+        set_verified(user.id, 1)
+        return True
+    msg = update.effective_message
+    if msg:
+        await msg.reply_text(
+            text=(
+                f"🔐 **{stylize('Verification Required')}**\n"
+                f"_{FONT_STYLE}_\n\n"
+                "Please join our update channel and support group, then tap "
+                "**I Am Verified** below to continue."
+            ),
+            parse_mode="Markdown", reply_markup=verification_keyboard(),
+        )
+    return False
+
+
+async def verification_command_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Runs before every /command (group=-1) so nothing works until the user is
+    verified — except /start itself, which has its own verification prompt."""
+    msg = update.effective_message
+    if msg and msg.text and msg.text.split()[0].split('@')[0] == "/start":
+        return
+    if not await require_verification(update, context):
+        raise ApplicationHandlerStop
+
+
+async def handle_update_channel_group_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Watches membership changes in UPDATE_CHANNEL / UPDATE_GROUP — requires the bot
+    to be an admin in both, which is also what makes check_user_membership work at
+    all. When a previously-verified user leaves or gets removed from either one, this
+    flips them back to unverified in the DB and DMs them a rejoin prompt, so the bot
+    stops working for them again until they rejoin and re-verify. (The DM only goes
+    through if the user has started a chat with the bot before — a Telegram
+    restriction, not something this code can work around.)"""
+    cmu = update.chat_member
+    if not cmu:
+        return
+    chat = cmu.chat
+    chat_ref = f"@{chat.username}" if chat.username else str(chat.id)
+    tracked_refs = {UPDATE_CHANNEL, UPDATE_GROUP, UPDATE_CHANNEL.lstrip('@'), UPDATE_GROUP.lstrip('@')}
+    if chat_ref not in tracked_refs and str(chat.id) not in tracked_refs:
+        return
+
+    valid_statuses = ('creator', 'administrator', 'member')
+    was_in = cmu.old_chat_member.status in valid_statuses
+    still_in = cmu.new_chat_member.status in valid_statuses
+    if not (was_in and not still_in):
+        return  # only care about member -> left/kicked transitions
+
+    user = cmu.new_chat_member.user
+    if user.is_bot or user.id == OWNER_ID:
+        return
+    set_verified(user.id, 0)
+    try:
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=(
+                "⚠️ **You left our update channel/group, so your verification was reset.**\n\n"
+                "The bot won't work again until you rejoin and verify.\n"
+                "Tap the buttons below, then hit **I Am Verified**."
+            ),
+            parse_mode="Markdown", reply_markup=verification_keyboard(),
+        )
+    except Exception as e:
+        logger.warning(f"Couldn't DM rejoin notice to {user.id} (they may not have started the bot): {e}")
+
+
+async def is_chat_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if update.effective_user.id == OWNER_ID:
+        return True
+    try:
+        member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
+        return member.status in ('creator', 'administrator')
+    except Exception:
+        return False
+
+
+# ==========================================
+# 🚀 BASIC COMMANDS
+# ==========================================
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_name = update.effective_user.first_name
+    user_data = get_user(user_id)
+
+    if context.args and context.args[0].startswith("ref_") and user_data['questions_used'] == 0:
+        try:
+            referrer_id = int(context.args[0][4:])
+            if referrer_id != user_id:
+                set_user_field(user_id, "referred_by", referrer_id)
+                increment_question_limit(referrer_id, 10)
+        except ValueError:
+            pass
+
+    is_verified = await check_user_membership(context.bot, user_id)
+
+    if not is_verified:
+        verify_msg = (
+            f"🔐 **{stylize('Verification Required')}**\n"
+            f"_{FONT_STYLE}_\n\n"
+            f"Hello **{user_name}**, to use this bot, please join our official update channel and support group first.\n\n"
+            f"Click **I Am Verified** after joining!"
+        )
+        await update.message.reply_text(text=verify_msg, parse_mode="Markdown", reply_markup=verification_keyboard())
+        return
+
+    set_verified(user_id, 1)
+    user_data = get_user(user_id)
+
+    if context.args and context.args[0].startswith("quiz_") and context.args[0][5:].isdigit():
+        quiz = get_quiz_meta(int(context.args[0][5:]))
+        if quiz:
+            timer_text = f"{quiz['timer_seconds']}s / question" if quiz['timer_seconds'] else "No limit"
+            text = (
+                f"📁 **{quiz['title']}**\n"
+                + (f"💬 {quiz['description']}\n" if quiz.get('description') else "") +
+                f"\n❓ Questions: {len(quiz['questions'])}\n"
+                f"⏱ Timer: {timer_text}"
+            )
+            await update.message.reply_text(
+                text, parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("▶️ Start Here", callback_data=f"oqstart_{quiz['id']}")]]
+                ),
+            )
+            return
+
+    await update.message.reply_text(
+        text=build_welcome_text(user_name, user_data),
+        parse_mode="Markdown",
+        reply_markup=main_welcome_keyboard()
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    daily_left = get_daily_ai_remaining(update.effective_user.id)
+    limit_line = "♾️ Unlimited AI generation" if daily_left is None else f"🎯 {daily_left}/{DAILY_AI_QUESTION_LIMIT} AI questions left today"
+    help_text = (
+        f"📖 **{stylize('Help & Commands List')}**\n"
+        f"_{FONT_STYLE}_ · {limit_line}\n\n"
+        f"📌 **Quiz Creation:**\n"
+        f"• `/topic` — MCQs from a topic or text\n"
+        f"• `/pdf` — MCQs from a PDF\n"
+        f"• `/image` — MCQs from a photo\n"
+        f"• `/csv` — MCQs from a CSV (exact, no AI)\n"
+        f"• `/youtube` — MCQs from a YouTube video\n"
+        f"• `/multi` — MCQs from multiple sources\n"
+        f"• `/section` — Section-wise quiz creator\n"
+        f"• `/voicequiz` — 🎙️ Bolo topic aur count, quiz ban jayegi\n"
+        f"• `/importchat` — 📥 Kisi channel/group ke forwarded messages se quiz banao\n"
+        f"• `/add_bulk` — 📥 Paste text OR upload a `.txt` file to bulk-create a quiz\n"
+        f"• `/edit` — Edit a saved quiz\n"
+        f"• `/default` — Set quiz default settings\n"
+        f"• `/regenerate` — Fresh MCQs from your last source\n\n"
+        f"🤖 **{stylize('Official Quiz')}** _(this bot's own branded quiz system)_**:**\n"
+        f"• `/officialquiz` — create a titled, timed Official Quiz\n"
+        f"• `/startquiz <id>` — start it live here. In a **group**, opens a waiting room "
+        f"first — needs 2 people to tap **✅ I Am Ready**; auto-pauses if 2 questions in "
+        f"a row get zero answers\n"
+        f"• `/mystore` — manage your quizzes: ✏️ title, 💬 description, ⏱ timer, ➕/➖ "
+        f"questions (all apply immediately) · 📊 **Status** (user_id + right/wrong/accuracy/"
+        f"speed) · 📁 file in a Set · 📤 Send to Channel · 🌐 make a quiz Public/Private\n"
+        f"• `/publicstore` — browse quizzes other users have made public\n\n"
+        f"📊 **Poll & Control:**\n"
+        f"• Forward any poll — auto-detects the ✅ answer when Telegram provides it "
+        f"(closed/quiz polls); otherwise asks you to tap it once\n"
+        f"• `/stoppoll` — Stop an active poll\n"
+        f"• `/stop`, `/pause`, `/resume` — Control the current flow\n\n"
+        f"🏆 **Leaderboards** _(always show user_id for direct contact)_**:**\n"
+        f"• `/leaderboard` — Points / Accuracy / Today, scoped to the current group\n"
+        f"• `/topusers` — Top 10 all-time by questions solved\n\n"
+        f"📁 **Quiz Sets:**\n"
+        f"• `/newset Name` — create a named folder for your quizzes\n"
+        f"• `/sets` — browse your sets and what's filed in each\n\n"
+        f"📤 **Channels:**\n"
+        f"• `/setchannel` — link a channel (add me as admin there, then forward a message from it)\n"
+        f"• `/mychannels` — list/remove linked channels\n\n"
+        f"🏷️ **Personalize** _(applies everywhere — AI-generated and Official Quiz alike)_**:**\n"
+        f"• `/settag YourTag` — shown under every question\n"
+        f"• `/setdescription YourTag` — shown in the explanation\n"
+        f"• `/optionstyle` — Plain / A) B) C) D) / 1) 2) 3) 4)\n"
+        f"• `/redeem CODE` — add to your quota\n\n"
+        f"🔑 **Your Own API Key(s):**\n"
+        f"• `/addapi` — add Groq, Gemini, OpenAI, Anthropic, or any open-source/self-hosted key — add as many as you want\n"
+        f"• `/myapi` — see everything saved and the order it's tried in\n"
+        f"• `/removeapi <id>` or `/removeapi all` — remove one or all, falls back to the bot's shared key\n\n"
+        f"🛡️ **Group Management:**\n"
+        f"• `/mute`, `/unmute`, `/purge`, `/info`\n"
+        f"• `/promote`, `/demote`\n"
+        f"• `/filter`, `/removefilter`, `/filters`\n"
+        f"• `/welcome on|off` — toggle join/leave messages\n"
+        f"• `/setwelcome`, `/setgoodbye` — customize them (`{{mention}}`, `{{name}}`, `{{group}}`)\n"
+        f"• `/schedule` — Schedule a resend of your last quiz\n"
+        f"• `/myschedules` — View or cancel pending scheduled quizzes"
+    )
+    await update.message.reply_text(text=help_text, parse_mode="Markdown")
+
+
+async def create_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"🛠️ **{stylize('Tools & Features Menu')}**\n_{FONT_STYLE}_\n\nSelect any tool below to proceed:",
+        parse_mode="Markdown", reply_markup=tools_menu_keyboard()
+    )
+
+
+async def stoppoll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.reply_to_message or not update.message.reply_to_message.poll:
+        await update.message.reply_text("Reply to one of the bot's poll messages with /stoppoll.")
+        return
+    try:
+        await context.bot.stop_poll(update.effective_chat.id, update.message.reply_to_message.message_id)
+        await update.message.reply_text("🛑 Poll stopped.")
+    except Exception as e:
+        await update.message.reply_text(f"Couldn't stop that poll: {e}")
+
+
+async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏸ Okay — I'll wait. Send /resume (or just carry on) whenever you're ready.")
+
+
+async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("▶️ Welcome back — go ahead.")
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.effective_message.reply_text(
+        "❌ Cancelled — nothing was lost. Your saved quizzes, API keys, groups and quota are all safe."
+    )
+    return ConversationHandler.END
+
+
+async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Same as /cancel but triggered from the inline '❌ Cancel' button that's
+    attached to every multi-step flow, so a mid-flow tap always exits cleanly
+    without losing anything already saved to the database."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data.clear()
+    try:
+        await query.edit_message_text(
+            "❌ Cancelled — nothing was lost. Your saved quizzes, API keys, groups and quota are all safe."
+        )
+    except Exception:
+        pass
+    return ConversationHandler.END
+
+
+def cancel_keyboard(extra_rows=None):
+    """Reusable '❌ Cancel' inline keyboard, optionally with extra rows above it."""
+    rows = list(extra_rows or [])
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="gcancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+# ==========================================
+# 🧠 AI QUIZ GENERATION — CONVERSATION FLOW
+# (shared by topic / pdf / image / youtube / multi / section)
+# ==========================================
+async def ai_entry(update: Update, context: ContextTypes.DEFAULT_TYPE, source_type: str):
+    context.user_data['gen_source_type'] = source_type
+    context.user_data['gen_parts'] = []
+    prompts = {
+        'topic': "Send me the topic or paste the text you want MCQs from.",
+        'pdf': "Send me the PDF file.",
+        'image': "Send me a photo of the page.",
+        'youtube': "Send me the YouTube video link.",
+        'multi': "Send text, PDFs, or photos — one at a time, any mix, any order. "
+                 "Tap **✅ Done** below (or send /done) when you're finished.",
+        'section': "Paste the full text you want split into sections.",
+    }
+    msg = update.effective_message
+    text = stylize("Let's build your quiz") + f"\n\n{prompts.get(source_type, 'Send your content.')}"
+    if source_type == 'multi':
+        keyboard = cancel_keyboard([[InlineKeyboardButton("✅ Done", callback_data="multi_done")]])
+    else:
+        keyboard = cancel_keyboard()
+    await msg.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    return ASK_CONTENT
+
+
+async def multi_done_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    parts = context.user_data.get('gen_parts', [])
+    if not parts:
+        await query.answer("You haven't sent anything yet — send at least one piece first.", show_alert=True)
+        return ASK_CONTENT
+    await query.edit_message_reply_markup(reply_markup=None)
+    return await ask_difficulty(update, context)
+
+
+def make_command_entry(source_type: str):
+    async def _entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if source_type == 'topic' and context.args:
+            context.user_data['gen_source_type'] = 'topic'
+            context.user_data['gen_parts'] = [{"type": "text", "text": " ".join(context.args)}]
+            return await ask_difficulty(update, context)
+        if source_type == 'youtube' and context.args:
+            await update.message.reply_text("Fetching transcript...")
+            try:
+                transcript = get_youtube_transcript(context.args[0])
+            except Exception as e:
+                await update.message.reply_text(f"Couldn't fetch that video's transcript: {e}")
+                return ConversationHandler.END
+            context.user_data['gen_source_type'] = 'youtube'
+            context.user_data['gen_parts'] = [{"type": "text", "text": transcript[:15000]}]
+            return await ask_difficulty(update, context)
+        return await ai_entry(update, context, source_type)
+    return _entry
+
+
+def make_button_entry(source_type: str):
+    async def _entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.callback_query.answer()
+        return await ai_entry(update, context, source_type)
+    return _entry
+
+
+topic_entry = make_command_entry('topic')
+pdf_entry = make_command_entry('pdf')
+image_entry = make_command_entry('image')
+youtube_entry = make_command_entry('youtube')
+multi_entry = make_command_entry('multi')
+section_entry = make_command_entry('section')
+
+topic_button_entry = make_button_entry('topic')
+pdf_button_entry = make_button_entry('pdf')
+image_button_entry = make_button_entry('image')
+youtube_button_entry = make_button_entry('youtube')
+multi_button_entry = make_button_entry('multi')
+
+
+async def receive_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    source_type = context.user_data.get('gen_source_type')
+    msg = update.effective_message
+
+    if source_type == 'topic':
+        if not msg.text:
+            await msg.reply_text("Please send text.")
+            return ASK_CONTENT
+        context.user_data['gen_parts'] = [{"type": "text", "text": msg.text}]
+        return await ask_difficulty(update, context)
+
+    if source_type == 'pdf':
+        if not (msg.document and msg.document.file_name and msg.document.file_name.lower().endswith('.pdf')):
+            await msg.reply_text("Please send a PDF file.")
+            return ASK_CONTENT
+        file = await msg.document.get_file()
+        data = await file.download_as_bytearray()
+        b64 = base64.b64encode(bytes(data)).decode()
+        context.user_data['gen_parts'] = [{
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": b64},
+        }]
+        return await ask_difficulty(update, context)
+
+    if source_type == 'image':
+        if not msg.photo:
+            await msg.reply_text("Please send a photo.")
+            return ASK_CONTENT
+        file = await msg.photo[-1].get_file()
+        data = await file.download_as_bytearray()
+        b64 = base64.b64encode(bytes(data)).decode()
+        context.user_data['gen_parts'] = [{
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
+        }]
+        return await ask_difficulty(update, context)
+
+    if source_type == 'youtube':
+        if not msg.text:
+            await msg.reply_text("Please send a YouTube link.")
+            return ASK_CONTENT
+        await msg.reply_text("Fetching transcript...")
+        try:
+            transcript = get_youtube_transcript(msg.text.strip())
+        except Exception as e:
+            await msg.reply_text(f"Couldn't fetch that video's transcript: {e}")
+            return ConversationHandler.END
+        context.user_data['gen_parts'] = [{"type": "text", "text": transcript[:15000]}]
+        return await ask_difficulty(update, context)
+
+    if source_type == 'section':
+        if not msg.text:
+            await msg.reply_text("Please send text.")
+            return ASK_CONTENT
+        context.user_data['gen_parts'] = [{"type": "text", "text": msg.text}]
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(str(n), callback_data=f"sec_{n}") for n in (2, 3, 4, 5)
+        ]])
+        await msg.reply_text("Split into how many sections?", reply_markup=keyboard)
+        return ASK_SECTION_COUNT
+
+    if source_type == 'multi':
+        parts = context.user_data.setdefault('gen_parts', [])
+        done_words = {'/done', 'done'}
+        if msg.text and msg.text.strip().lower() in done_words:
+            if not parts:
+                await msg.reply_text("You haven't sent anything yet.")
+                return ASK_CONTENT
+            return await ask_difficulty(update, context)
+        if msg.text:
+            parts.append({"type": "text", "text": msg.text})
+        elif msg.document and msg.document.file_name and msg.document.file_name.lower().endswith('.pdf'):
+            file = await msg.document.get_file()
+            data = await file.download_as_bytearray()
+            b64 = base64.b64encode(bytes(data)).decode()
+            parts.append({"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": b64}})
+        elif msg.photo or (msg.document and msg.document.mime_type and msg.document.mime_type.startswith('image/')):
+            # Covers both a compressed Telegram "photo" AND an image sent as an
+            # uncompressed file/document — both are common on mobile and both were
+            # silently rejected before.
+            if msg.photo:
+                file = await msg.photo[-1].get_file()
+                media_type = "image/jpeg"
+            else:
+                file = await msg.document.get_file()
+                media_type = msg.document.mime_type
+            data = await file.download_as_bytearray()
+            b64 = base64.b64encode(bytes(data)).decode()
+            parts.append({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}})
+        else:
+            keyboard = cancel_keyboard([[InlineKeyboardButton("✅ Done", callback_data="multi_done")]])
+            await msg.reply_text("Send text, a PDF, or a photo — or tap ✅ Done to continue.", reply_markup=keyboard)
+            return ASK_CONTENT
+        keyboard = cancel_keyboard([[InlineKeyboardButton("✅ Done", callback_data="multi_done")]])
+        await msg.reply_text(f"Got it — {len(parts)} piece(s) added so far. Send more, or tap ✅ Done to continue.",
+                              reply_markup=keyboard)
+        return ASK_CONTENT
+
+    return ConversationHandler.END
+
+
+async def ask_difficulty(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_user.id)
+    chat_id = update.effective_chat.id
+    if user['default_difficulty']:
+        context.user_data['gen_difficulty'] = user['default_difficulty']
+        return await ask_language(update, context)
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🟢 Easy", callback_data="diff_easy"),
+        InlineKeyboardButton("🟡 Medium", callback_data="diff_medium"),
+        InlineKeyboardButton("🔴 Hard", callback_data="diff_hard"),
+    ]])
+    await context.bot.send_message(chat_id, "Pick a difficulty:", reply_markup=keyboard)
+    return ASK_DIFFICULTY
+
+
+async def receive_difficulty(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['gen_difficulty'] = query.data.replace('diff_', '')
+    await query.edit_message_reply_markup(reply_markup=None)
+    return await ask_language(update, context)
+
+
+async def ask_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_user.id)
+    chat_id = update.effective_chat.id
+    if user['default_language']:
+        context.user_data['gen_language'] = user['default_language']
+        return await ask_count(update, context)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("English", callback_data="lang_English"),
+         InlineKeyboardButton("Hindi", callback_data="lang_Hindi")],
+        [InlineKeyboardButton("✍️ Type another language", callback_data="lang_other")],
+    ])
+    await context.bot.send_message(chat_id, "Pick a language:", reply_markup=keyboard)
+    return ASK_LANGUAGE
+
+
+async def receive_language_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_reply_markup(reply_markup=None)
+    if query.data == 'lang_other':
+        context.user_data['awaiting_custom_language'] = True
+        await context.bot.send_message(update.effective_chat.id, "Type the language name:")
+        return ASK_LANGUAGE
+    context.user_data['gen_language'] = query.data.replace('lang_', '')
+    return await ask_count(update, context)
+
+
+async def receive_language_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('awaiting_custom_language'):
+        await update.message.reply_text("Please tap one of the language buttons above (or 'Other' to type your own).")
+        return ASK_LANGUAGE
+    context.user_data['gen_language'] = update.message.text.strip()[:30]
+    context.user_data['awaiting_custom_language'] = False
+    return await ask_count(update, context)
+
+
+async def ask_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if context.user_data.get('gen_count'):
+        # Count was already decided upstream (e.g. spoken in a Voice → Quiz command)
+        # — skip the button prompt and go straight to generation.
+        await context.bot.send_message(chat_id, stylize("Generating your quiz") + "...")
+        return await run_generation(update, context)
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("5", callback_data="cnt_5"),
+        InlineKeyboardButton("10", callback_data="cnt_10"),
+        InlineKeyboardButton("15", callback_data="cnt_15"),
+        InlineKeyboardButton("20", callback_data="cnt_20"),
+    ]])
+    await context.bot.send_message(chat_id, "How many questions?", reply_markup=keyboard)
+    return ASK_COUNT
+
+
+async def receive_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_reply_markup(reply_markup=None)
+    context.user_data['gen_count'] = int(query.data.replace('cnt_', ''))
+    await context.bot.send_message(update.effective_chat.id, stylize("Generating your quiz") + "...")
+    return await run_generation(update, context)
+
+
+async def run_generation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    user = get_user(user_id)
+
+    remaining = user['question_limit'] - user['questions_used']
+    if remaining <= 0:
+        await context.bot.send_message(chat_id, "You've used your full quota. Use /redeem CODE to add more.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    daily_left = get_daily_ai_remaining(user_id)
+    if daily_left is not None:
+        if daily_left <= 0:
+            await context.bot.send_message(
+                chat_id,
+                f"⏳ Aaj ka {DAILY_AI_QUESTION_LIMIT}-question AI limit khatam ho gaya — UTC midnight ke baad "
+                "reset hoga. (/csv se banai gayi quiz is limit me nahi ginti.)"
+            )
+            context.user_data.clear()
+            return ConversationHandler.END
+        remaining = min(remaining, daily_left)
+
+    count = min(context.user_data.get('gen_count', 10), remaining)
+    parts = context.user_data.get('gen_parts', [])
+    difficulty = context.user_data.get('gen_difficulty', 'medium')
+    language = context.user_data.get('gen_language', 'English')
+    source_type = context.user_data.get('gen_source_type', 'topic')
+
+    if not parts:
+        await context.bot.send_message(chat_id, "Something went wrong — no content was captured. Please try again.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    try:
+        questions = await asyncio.to_thread(generate_mcqs_sync, user_id, parts, count, difficulty, language)
+    except RuntimeError as e:
+        await context.bot.send_message(chat_id, f"⚠️ {e}")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    sent = await post_quiz_polls(context.bot, chat_id, questions, user_tag=user['tag'],
+                                  explanation_tag=user['description_tag'], option_style=user['option_style'])
+    increment_questions_used(user_id, sent)
+    record_daily_ai_usage(user_id, sent)
+
+    title = "Quiz"
+    for p in parts:
+        if p.get('type') == 'text':
+            title = p['text'][:50]
+            break
+    save_quiz(user_id, title, questions)
+    save_last_source(user_id, source_type, parts, difficulty, language, count)
+
+    await context.bot.send_message(chat_id, f"✅ Done — {sent} question(s) posted.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def receive_section_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_reply_markup(reply_markup=None)
+    n = int(query.data.replace('sec_', ''))
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    user = get_user(user_id)
+
+    full_text = context.user_data['gen_parts'][0]['text']
+    chunk_size = max(1, len(full_text) // n)
+    chunks = [full_text[i:i + chunk_size] for i in range(0, len(full_text), chunk_size)][:n]
+
+    daily_left = get_daily_ai_remaining(user_id)
+    if daily_left is not None and daily_left <= 0:
+        await context.bot.send_message(
+            chat_id, f"⏳ Aaj ka {DAILY_AI_QUESTION_LIMIT}-question AI limit khatam ho gaya — UTC midnight ke baad reset hoga."
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    await context.bot.send_message(chat_id, f"Generating {len(chunks)} section(s)...")
+
+    total_sent = 0
+    for i, chunk in enumerate(chunks, 1):
+        remaining = user['question_limit'] - user['questions_used'] - total_sent
+        if daily_left is not None:
+            remaining = min(remaining, daily_left - total_sent)
+        if remaining <= 0:
+            break
+        try:
+            questions = await asyncio.to_thread(
+                generate_mcqs_sync, user_id, [{"type": "text", "text": chunk}], min(5, remaining), 'medium', 'English'
+            )
+        except RuntimeError:
+            continue
+        tag = f"Section {i}" + (f" · {user['tag']}" if user['tag'] else '')
+        sent = await post_quiz_polls(context.bot, chat_id, questions, user_tag=tag, explanation_tag=user['description_tag'])
+        total_sent += sent
+
+    increment_questions_used(user_id, total_sent)
+    await context.bot.send_message(chat_id, f"✅ Done — {total_sent} question(s) across {len(chunks)} section(s).")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# ==========================================
+# 🎙️ VOICE → QUIZ CONVERSATION FLOW
+# ==========================================
+async def voice_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop('gen_count', None)
+    text = (
+        f"🎙️ **{stylize('Voice se Quiz')}**\n_{FONT_STYLE}_\n\n"
+        "Ek voice message bhejo — bas bolo kis topic pe kitne questions chahiye.\n\n"
+        "Jaise: _\"Science ke 10 sawal banao\"_ ya _\"Make 5 questions on Indian history\"_."
+    )
+    await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=cancel_keyboard())
+    return ASK_VOICE
+
+
+async def voice_button_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    return await voice_entry(update, context)
+
+
+async def receive_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    voice = msg.voice or msg.audio
+    if not voice:
+        await msg.reply_text("Please send a voice message (🎤 hold to record), or tap Cancel.", reply_markup=cancel_keyboard())
+        return ASK_VOICE
+
+    file = await voice.get_file()
+    data = await file.download_as_bytearray()
+    await msg.reply_text(stylize("Sun raha hoon") + "...")
+
+    try:
+        transcript = await asyncio.to_thread(transcribe_voice_sync, update.effective_user.id, bytes(data))
+    except RuntimeError as e:
+        await msg.reply_text(str(e))
+        return ConversationHandler.END
+
+    topic, count = parse_voice_command(transcript)
+    if not topic:
+        await msg.reply_text(
+            f"Sun toh liya (\"{transcript}\"), lekin topic samajh nahi aaya. Fir se try karo — "
+            "jaise \"History ke 5 sawal banao\"."
+        )
+        return ASK_VOICE
+
+    context.user_data['gen_source_type'] = 'voice'
+    context.user_data['gen_parts'] = [{"type": "text", "text": topic}]
+    context.user_data['gen_count'] = count
+    await msg.reply_text(
+        f"🎧 Samjha: **{topic}** pe **{count}** sawal. Ab difficulty chuno.",
+        parse_mode="Markdown",
+    )
+    return await ask_difficulty(update, context)
+
+
+# ==========================================
+# 📥 IMPORT FROM CHANNEL/GROUP (forward messages — no login/session needed)
+# ==========================================
+async def import_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['import_texts'] = []
+    text = (
+        f"📥 **{stylize('Import from Channel or Group')}**\n_{FONT_STYLE}_\n\n"
+        "Kisi bhi channel/group ke text messages se quiz banane ke liye, unhe seedha yahan "
+        "**forward** kar do — ek-ek karke, ya Telegram me multi-select karke ek saath bhi bhej sakte ho.\n\n"
+        "_(Login/session string ki koi zaroorat nahi — bas jo message forward hoga, wahi content use hoga.)_\n\n"
+        "Sab forward ho jaye to **✅ Done** dabao."
+    )
+    keyboard = cancel_keyboard([[InlineKeyboardButton("✅ Done", callback_data="import_done")]])
+    await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    return IMPORT_COLLECT
+
+
+async def import_button_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    return await import_entry(update, context)
+
+
+async def receive_import_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg.text:
+        keyboard = cancel_keyboard([[InlineKeyboardButton("✅ Done", callback_data="import_done")]])
+        await msg.reply_text("Sirf text messages forward karo (photo/PDF nahi).", reply_markup=keyboard)
+        return IMPORT_COLLECT
+    cleaned = _clean_poll_text(msg.text)
+    if cleaned and len(cleaned) > 3:
+        context.user_data.setdefault('import_texts', []).append(cleaned)
+    count = len(context.user_data.get('import_texts', []))
+    keyboard = cancel_keyboard([[InlineKeyboardButton("✅ Done", callback_data="import_done")]])
+    await msg.reply_text(f"➕ {count} message(s) collect ho gaye. Aur forward karo, ya ✅ Done dabao.", reply_markup=keyboard)
+    return IMPORT_COLLECT
+
+
+async def import_done_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    texts = context.user_data.get('import_texts', [])
+    if not texts:
+        await query.answer("Pehle kam se kam ek message forward karo.", show_alert=True)
+        return IMPORT_COLLECT
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text(
+        "🔎 Kisi specific topic/keyword pe filter karna hai? Type karke bhejo — ya *skip* likh do sab content use karne ke liye.",
+        parse_mode="Markdown", reply_markup=cancel_keyboard(),
+    )
+    return IMPORT_KEYWORD
+
+
+async def receive_import_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    texts = context.user_data.get('import_texts', [])
+    keyword = (msg.text or '').strip()
+    if keyword.lower() != 'skip' and keyword:
+        filtered = [t for t in texts if keyword.lower() in t.lower()]
+        if not filtered:
+            await msg.reply_text(f"'{keyword}' se match karta hua kuch nahi mila — sab collected content use kar raha hoon.")
+        else:
+            texts = filtered
+    combined = "\n\n".join(texts)[:15000]
+    context.user_data['gen_source_type'] = 'import'
+    context.user_data['gen_parts'] = [{"type": "text", "text": combined}]
+    context.user_data.pop('import_texts', None)
+    return await ask_difficulty(update, context)
+
+
+# ==========================================
+# 📊 CSV QUIZ FLOW (no AI, exact match)
+# ==========================================
+async def csv_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "Send your CSV file.\n\n"
+        "Format (first row = header):\n"
+        "question,option1,option2,option3,option4,correct_option,explanation\n\n"
+        "• correct_option is 1-4\n• explanation is optional",
+        reply_markup=cancel_keyboard(),
+    )
+    return ASK_CSV
+
+
+async def csv_button_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    return await csv_entry(update, context)
+
+
+async def receive_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not (msg.document and msg.document.file_name and msg.document.file_name.lower().endswith('.csv')):
+        await msg.reply_text("Please send a .csv file.")
+        return ASK_CSV
+
+    file = await msg.document.get_file()
+    data = await file.download_as_bytearray()
+    text = bytes(data).decode('utf-8', errors='replace')
+
+    questions = []
+    reader = csv.DictReader(io.StringIO(text))
+    for row in reader:
+        try:
+            options = [row['option1'], row['option2'], row['option3'], row['option4']]
+            correct = int(row['correct_option']) - 1
+            if not (0 <= correct < 4):
+                correct = 0
+            questions.append({
+                "question": row['question'][:290],
+                "options": [o[:100] for o in options],
+                "correct_index": correct,
+                "explanation": (row.get('explanation') or '')[:195],
+            })
+        except (KeyError, ValueError, TypeError):
+            continue
+
+    if not questions:
+        await msg.reply_text("No valid rows found — check the CSV format and try again.")
+        return ConversationHandler.END
+
+    user_id = update.effective_user.id
+    user = get_user(user_id)
+    chat_id = update.effective_chat.id
+
+    remaining = user['question_limit'] - user['questions_used']
+    if remaining <= 0:
+        await msg.reply_text("You've used your full quota. Use /redeem CODE to add more.")
+        return ConversationHandler.END
+    questions = questions[:remaining]
+
+    sent = await post_quiz_polls(context.bot, chat_id, questions, user_tag=user['tag'], explanation_tag=user['description_tag'])
+    increment_questions_used(user_id, sent)
+    save_quiz(user_id, "CSV Quiz", questions)
+    await msg.reply_text(f"✅ Done — {sent} question(s) posted from your CSV.")
+    return ConversationHandler.END
+
+
+# ==========================================
+# 🔄 POLL → QUIZ CONVERSION (clean numbering / tags / links / stylish-font watermarks)
+# ==========================================
+# Strips leading numbering ("1.", "Q3)", "23 -"), [Tag]/#hashtag/@mention noise, any
+# link (https://, t.me/..., discord.gg/...), and "stylish name" branding blocks made
+# of combining marks + rare decorative Unicode scripts/symbols (the ⟵꯭᪵𓆩...🌷 style
+# watermarks channels glue onto questions) — leaving only the bare question/option text.
+import unicodedata
+
+_POLL_NUMBERING_RE = re.compile(r'^\s*(?:[Qq](?:uestion|ues|uiz)?\.?\s*)?(?:\d{1,3}|[A-Da-d])\s*[\.\)\-:]\s*')
+_POLL_LINK_RE = re.compile(r'(https?://\S+|www\.\S+|t\.me/\S+|discord(?:\.gg|app\.com)/\S+|@\w{4,32})', re.IGNORECASE)
+_POLL_TAG_RE = re.compile(r'\[[^\]\n]{1,60}\]|\#\w+|【[^】\n]{1,60}】|〘[^〙\n]{1,60}〙')
+
+# Unicode code-point ranges treated as "normal content" — common languages/scripts a
+# real quiz question is likely written in. Everything else that's a *letter* (rare
+# scripts like Meetei Mayek, Tai Viet, Kaithi, Ugaritic, IPA small-caps, etc. commonly
+# reused purely to fake a "stylish font") gets dropped.
+_SCRIPT_WHITELIST = (
+    (0x0000, 0x024F),   # Basic Latin, Latin-1 Supplement, Latin Extended A/B
+    (0x0370, 0x03FF),   # Greek
+    (0x0400, 0x04FF),   # Cyrillic
+    (0x0590, 0x06FF),   # Hebrew, Arabic
+    (0x0900, 0x097F),   # Devanagari (Hindi)
+    (0x3040, 0x30FF),   # Hiragana, Katakana
+    (0x4E00, 0x9FFF),   # CJK Unified Ideographs
+    (0xAC00, 0xD7A3),   # Hangul
+    (0x2000, 0x206F),   # General punctuation (dashes, quotes, ellipsis...)
+    (0x20A0, 0x20CF),   # Currency symbols
+    (0x2200, 0x22FF),   # Mathematical operators (×÷≠≤≥ etc. — legit in quiz questions)
+)
+
+
+def _in_whitelist(cp: int) -> bool:
+    return any(lo <= cp <= hi for lo, hi in _SCRIPT_WHITELIST)
+
+
+def _clean_poll_text(text: str) -> str:
+    """Cleans a forwarded poll's question/option text: removes numbering, [Tag]/#tag
+    markers, links, stylish-font "watermark" glyphs, and collapses extra whitespace."""
+    if not text:
+        return text
+    # NFKD turns most "𝗕𝗼𝗹𝗱"/"𝘐𝘵𝘢𝘭𝘪𝘤" mathematical-alphanumeric fancy letters back
+    # into plain ASCII before anything else runs.
+    t = unicodedata.normalize('NFKD', text)
+
+    kept = []
+    for ch in t:
+        cat = unicodedata.category(ch)
+        cp = ord(ch)
+        if cat == 'Cf':
+            continue  # invisible joiners/format chars — always safe to drop
+        if cat in ('Mn', 'Me') and not _in_whitelist(cp):
+            continue  # decorative combining marks — but NOT Devanagari matras/virama etc.,
+                      # which live inside the whitelisted block and must stay
+        if cat == 'So' and cp > 0x2100:
+            continue  # dingbats, hieroglyphs, musical/ancient/misc symbols used as decoration
+        if cat == 'Sm' and not _in_whitelist(cp):
+            continue  # decorative arrows/math-lookalike symbols outside real math operators
+        if cat in ('Po', 'Pd', 'Ps', 'Pe', 'Pc') and cp > 0x2E00 and not _in_whitelist(cp):
+            continue  # rare-script punctuation (e.g. Javanese/Meetei marks) used as decoration
+        if cat.startswith('L') and not _in_whitelist(cp):
+            continue  # rare/lookalike script letters used to fake a "stylish font"
+        kept.append(ch)
+    t = ''.join(kept)
+
+    t = _POLL_LINK_RE.sub('', t)
+    t = _POLL_TAG_RE.sub('', t)
+    t = _POLL_NUMBERING_RE.sub('', t)
+    t = re.sub(r'\s{2,}', ' ', t)
+    t = t.strip(" -–—:.•|\u200b")
+    return t or text.strip()  # never return an empty string — fall back to the raw text
+
+
+async def create_quiz_from_poll_data(bot, chat_id, question, options, correct_index, user_tag: str = '', explanation_tag: str = ''):
+    clean_question = _clean_poll_text(question)
+    clean_options = [_clean_poll_text(o) for o in options]
+    question_text = clean_question
+    if user_tag:
+        question_text = f"{question_text}\n\n🏷 {user_tag}"
+    explanation = f"💡 {explanation_tag}" if explanation_tag else None
+    await bot.send_poll(
+        chat_id=chat_id,
+        question=question_text[:300],
+        options=[o[:100] for o in clean_options],
+        type=Poll.QUIZ,
+        correct_option_id=correct_index,
+        explanation=explanation[:200] if explanation else None,
+        is_anonymous=False,
+    )
+    return clean_question, clean_options
+
+
+async def handle_forwarded_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    poll = msg.poll
+    if not poll:
+        return
+
+    # If this poll was forwarded while collecting questions for an Official Quiz
+    # (see officialquiz_* flow below), buffer it there instead of posting it live.
+    if context.user_data.get('oq_collecting'):
+        await handle_oq_forwarded_poll(update, context)
+        return
+
+    # If this poll was forwarded while the Poll → Text tool is active, buffer it
+    # there instead (see polltxt_* below) — it doesn't post a quiz poll at all.
+    if context.user_data.get('polltxt_collecting'):
+        await handle_polltxt_forwarded_poll(update, context)
+        return
+
+    if poll.type == Poll.QUIZ and poll.is_closed and poll.correct_option_id is not None:
+        user = get_user(update.effective_user.id) if update.effective_user else {"tag": "", "description_tag": ""}
+        await create_quiz_from_poll_data(
+            context.bot, update.effective_chat.id,
+            poll.question, [o.text for o in poll.options], poll.correct_option_id,
+            user_tag=user['tag'], explanation_tag=user['description_tag'],
+        )
+        return
+
+    pending_id = str(msg.message_id)
+    context.chat_data.setdefault('pending_polls', {})[pending_id] = {
+        "question": poll.question,
+        "options": [o.text for o in poll.options],
+    }
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{i + 1}. {_clean_poll_text(o.text)[:30]}", callback_data=f"pollcorrect_{pending_id}_{i}")]
+        for i, o in enumerate(poll.options)
+    ])
+    await msg.reply_text("Which option is correct?", reply_markup=keyboard)
+
+
+async def handle_poll_correct_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, pending_id, idx = query.data.split('_', 2)
+    pending = context.chat_data.get('pending_polls', {}).pop(pending_id, None)
+    if not pending:
+        await query.edit_message_text("This poll conversion expired — please forward the poll again.")
+        return
+    user = get_user(update.effective_user.id) if update.effective_user else {"tag": "", "description_tag": ""}
+    await create_quiz_from_poll_data(
+        context.bot, update.effective_chat.id, pending['question'], pending['options'], int(idx),
+        user_tag=user['tag'], explanation_tag=user['description_tag'],
+    )
+    await query.edit_message_text("✅ Converted to a clean quiz poll.")
+
+
+# ==========================================
+# 📋 POLL → TEXT (forward any number of polls — even 500 — get one .txt back)
+# ==========================================
+def _polltxt_progress_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Done — Export .txt", callback_data="polltxt_done")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="polltxt_cancel")],
+    ])
+
+
+async def polltxt_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    context.user_data['polltxt_collecting'] = True
+    context.user_data['polltxt_questions'] = []
+    context.user_data.pop('polltxt_progress_msg_id', None)
+    context.user_data.pop('polltxt_progress_last_edit', None)
+    await query.edit_message_text(
+        text=(
+            f"📋 **{stylize('Poll → Text')}**\n_{FONT_STYLE}_\n\n"
+            "Forward any quiz polls into this chat, one by one (or many at once — "
+            "even a batch of 500). For each one I'll figure out the correct option "
+            "automatically if it's a closed/answered quiz poll, or ask you to pick it.\n\n"
+            "Tap **✅ Done** when you're finished and I'll send back one `.txt` file "
+            "with every question, in this format:\n\n"
+            "```\nQuestion text\nOption A\nOption B\nOption C ✅️\nOption D\n```"
+        ),
+        parse_mode="Markdown", reply_markup=_polltxt_progress_keyboard(),
+    )
+
+
+async def _polltxt_update_progress(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Edits a single progress message instead of sending one per forwarded poll —
+    same flood-control fix used for the Official Quiz forward flow."""
+    count = len(context.user_data.get('polltxt_questions', []))
+    now = time.monotonic()
+    last = context.user_data.get('polltxt_progress_last_edit', 0)
+    msg_id = context.user_data.get('polltxt_progress_msg_id')
+    text = f"➕ {count} question(s) captured so far. Forward more, or tap ✅ Done."
+    if msg_id and now - last < 1.5:
+        return
+    try:
+        if msg_id:
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=msg_id, text=text, reply_markup=_polltxt_progress_keyboard()
+            )
+        else:
+            sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=_polltxt_progress_keyboard())
+            context.user_data['polltxt_progress_msg_id'] = sent.message_id
+        context.user_data['polltxt_progress_last_edit'] = now
+    except Exception as e:
+        logger.warning(f"Poll → Text progress update failed (non-fatal): {e}")
+
+
+async def handle_polltxt_forwarded_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    poll = msg.poll
+    if not poll:
+        return
+    try:
+        options = [o.text for o in poll.options]
+        questions = context.user_data.setdefault('polltxt_questions', [])
+
+        if poll.type == Poll.QUIZ and poll.correct_option_id is not None:
+            if not (2 <= len(options) <= 10):
+                return  # skip malformed polls rather than crash the batch
+            questions.append({
+                "question": _clean_poll_text(poll.question),
+                "options": [_clean_poll_text(o) for o in options],
+                "correct_index": poll.correct_option_id,
+            })
+            await _polltxt_update_progress(context, msg.chat_id)
+            return
+
+        pending_id = str(msg.message_id)
+        context.user_data.setdefault('polltxt_pending_polls', {})[pending_id] = {"question": poll.question, "options": options}
+        pick_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"{i + 1}. {_clean_poll_text(o)[:30]}", callback_data=f"polltxtcorrect_{pending_id}_{i}")]
+            for i, o in enumerate(options)
+        ])
+        await msg.reply_text("Which option is correct for this one?", reply_markup=pick_keyboard)
+    except Exception as e:
+        logger.warning(f"handle_polltxt_forwarded_poll error (collection preserved): {e}")
+
+
+async def polltxt_poll_correct_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, pending_id, idx = query.data.split('_', 2)
+        pending = context.user_data.get('polltxt_pending_polls', {}).pop(pending_id, None)
+        if not pending:
+            await query.edit_message_text("Expired — forward that poll again.")
+            return
+        context.user_data.setdefault('polltxt_questions', []).append({
+            "question": _clean_poll_text(pending['question']),
+            "options": [_clean_poll_text(o) for o in pending['options']],
+            "correct_index": int(idx),
+        })
+        count = len(context.user_data['polltxt_questions'])
+        await query.edit_message_text(f"➕ {count} question(s) captured so far. Forward more, or tap Done.")
+    except Exception as e:
+        logger.warning(f"polltxt_poll_correct_choice error: {e}")
+
+
+async def polltxt_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['polltxt_collecting'] = False
+    questions = context.user_data.pop('polltxt_questions', [])
+    context.user_data.pop('polltxt_pending_polls', None)
+    context.user_data.pop('polltxt_progress_msg_id', None)
+    if not questions:
+        await query.edit_message_text(
+            "You haven't forwarded any polls yet.", reply_markup=back_to_tools_keyboard()
+        )
+        return
+    export_text = build_poll_text_export(questions)
+    file_buffer = io.BytesIO(export_text.encode("utf-8"))
+    file_buffer.name = "polls.txt"
+    await context.bot.send_document(
+        chat_id=query.message.chat_id,
+        document=file_buffer,
+        filename="polls.txt",
+        caption=f"📋 {len(questions)} question(s) converted to text.",
+    )
+    await query.edit_message_text(
+        f"✅ Done — sent {len(questions)} question(s) as a .txt file above.",
+        reply_markup=back_to_tools_keyboard(),
+    )
+
+
+async def polltxt_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['polltxt_collecting'] = False
+    context.user_data.pop('polltxt_questions', None)
+    context.user_data.pop('polltxt_pending_polls', None)
+    context.user_data.pop('polltxt_progress_msg_id', None)
+    await query.edit_message_text("❌ Cancelled — nothing was saved.", reply_markup=back_to_tools_keyboard())
+
+
+# ==========================================
+# 🤖 OFFICIAL QUIZ BOT (title → timer → forward/bulk → start/share → live control → leaderboard)
+# ==========================================
+BULK_FORMAT_HELP = (
+    "Step 3/3 — send your questions in this exact format (send as many messages as "
+    "you need — one big batch or several smaller ones, I'll combine them):\n\n"
+    "```\n"
+    "Question text here?\n"
+    "Option 1\n"
+    "Option 2\n"
+    "Option 3 ✅️\n"
+    "Option 4\n"
+    "\n"
+    "Next question?\n"
+    "Option 1\n"
+    "Option 2 ✅️\n"
+    "```\n"
+    "One blank line between questions, 2–4 options per question, and put the ✅️ mark "
+    "right after the correct option. Tap **✅ Done** below once you're finished."
+)
+
+# Matches a ✅/✔ checkmark (with or without the emoji variation-selector) trailing an
+# option line, in any of the common forms people paste: ✅️ ✅ ✔️ ✔
+_CHECK_MARK_RE = re.compile(r'\s*(?:✅\uFE0F?|✔\uFE0F?)\s*$')
+
+
+def _strip_check_mark(line: str) -> tuple:
+    """Returns (text_without_mark, was_marked_correct)."""
+    marked = bool(_CHECK_MARK_RE.search(line))
+    return _CHECK_MARK_RE.sub('', line).strip(), marked
+
+
+def parse_bulk_questions(text: str) -> list:
+    """Question-per-block format: one blank line between questions, first line is the
+    question, following lines are options (2-4), and the correct option is marked with
+    a trailing ✅️. No "Q:"/"Answer:" labels needed."""
+    questions = []
+    blocks = re.split(r'\n\s*\n', text.strip())
+    for block in blocks:
+        lines = [l.strip() for l in block.strip().split('\n') if l.strip()]
+        if len(lines) < 3:  # need a question line + at least 2 option lines
+            continue
+        q_raw, _ = _strip_check_mark(lines[0])
+        q_text = _clean_poll_text(q_raw)
+        options = []
+        correct_index = None
+        for i, line in enumerate(lines[1:5]):  # cap at 4 options
+            opt_raw, is_correct = _strip_check_mark(line)
+            opt_raw = re.sub(r'^[A-Da-d]\s*[\.\)]\s*', '', opt_raw)  # tolerate an optional "A) " prefix
+            options.append(_clean_poll_text(opt_raw))
+            if is_correct:
+                correct_index = i
+        if len(options) < 2 or correct_index is None:
+            continue
+        questions.append({"question": q_text, "options": options, "correct_index": correct_index, "explanation": ""})
+    return questions
+
+
+def build_poll_text_export(questions: list) -> str:
+    """Inverse of parse_bulk_questions — turns quiz-poll data back into the same
+    checkmark text format, used by the Poll → Text tool."""
+    blocks = []
+    for q in questions:
+        lines = [q['question']]
+        for i, opt in enumerate(q['options']):
+            lines.append(f"{opt} ✅️" if i == q['correct_index'] else opt)
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+async def officialquiz_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['oq_questions'] = []
+    context.user_data['oq_collecting'] = False
+    await update.effective_message.reply_text(
+        f"🤖 **{stylize('Official Quiz Bot')}**\n_{FONT_STYLE}_\n\nStep 1/3 — send a *title* for this quiz.",
+        parse_mode="Markdown", reply_markup=cancel_keyboard(),
+    )
+    return OQ_TITLE
+
+
+async def officialquiz_button_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    return await officialquiz_entry(update, context)
+
+
+async def oq_receive_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    title = (update.message.text or "").strip()[:60]
+    if not title:
+        await update.message.reply_text("Please send a valid title, or tap Cancel.", reply_markup=cancel_keyboard())
+        return OQ_TITLE
+    context.user_data['oq_title'] = title
+    keyboard = cancel_keyboard([
+        [InlineKeyboardButton("10s", callback_data="oqt_10"), InlineKeyboardButton("15s", callback_data="oqt_15"),
+         InlineKeyboardButton("20s", callback_data="oqt_20")],
+        [InlineKeyboardButton("30s", callback_data="oqt_30"), InlineKeyboardButton("60s", callback_data="oqt_60"),
+         InlineKeyboardButton("⏱ No Timer", callback_data="oqt_0")],
+    ])
+    await update.message.reply_text("Step 2/3 — pick a per-question timer:", reply_markup=keyboard)
+    return OQ_TIMER
+
+
+async def oq_receive_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['oq_timer'] = int(query.data.replace("oqt_", ""))
+    keyboard = cancel_keyboard([[
+        InlineKeyboardButton("📥 Forward Polls", callback_data="oqm_forward"),
+        InlineKeyboardButton("📝 Bulk Text Format", callback_data="oqm_bulk"),
+    ]])
+    await query.edit_message_text("Step 3/3 — how do you want to add questions?", reply_markup=keyboard)
+    return OQ_METHOD
+
+
+async def oq_receive_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    method = query.data.replace("oqm_", "")
+    if method == "forward":
+        context.user_data['oq_collecting'] = True
+        keyboard = cancel_keyboard([[InlineKeyboardButton("✅ Done — Finish Quiz", callback_data="oqdone_forward")]])
+        await query.edit_message_text(
+            "Forward your quiz polls into this chat, one by one — numbering/tags/links are cleaned "
+            "automatically. Tap **✅ Done** below once you've forwarded them all.",
+            parse_mode="Markdown", reply_markup=keyboard,
+        )
+        return OQ_COLLECT
+    await query.edit_message_text(BULK_FORMAT_HELP, parse_mode="Markdown", reply_markup=cancel_keyboard())
+    return OQ_BULK
+
+
+async def _oq_update_progress(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Shows collection progress by editing a single message instead of sending a new
+    one per forwarded poll — sending 500 separate replies for a 500-poll batch is what
+    was hitting Telegram's flood control and making the flow appear to crash."""
+    count = len(context.user_data.get('oq_questions', []))
+    now = time.monotonic()
+    last = context.user_data.get('oq_progress_last_edit', 0)
+    msg_id = context.user_data.get('oq_progress_msg_id')
+    keyboard = cancel_keyboard([[InlineKeyboardButton("✅ Done — Finish Quiz", callback_data="oqdone_forward")]])
+    text = f"➕ {count} question(s) added so far. Forward more, or tap ✅ Done when finished."
+    if msg_id and now - last < 1.5:
+        return  # throttled — the count is still accurate for the next edit or Done tap
+    try:
+        if msg_id:
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=keyboard)
+        else:
+            sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+            context.user_data['oq_progress_msg_id'] = sent.message_id
+        context.user_data['oq_progress_last_edit'] = now
+    except Exception as e:
+        logger.warning(f"OQ progress update failed (non-fatal, collection continues): {e}")
+
+
+async def handle_oq_forwarded_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Buffers a forwarded poll into the in-progress Official Quiz instead of
+    posting it live (called from handle_forwarded_poll while oq_collecting=True)."""
+    msg = update.effective_message
+    poll = msg.poll
+    if not poll:
+        return
+    try:
+        options = [o.text for o in poll.options]
+        questions = context.user_data.setdefault('oq_questions', [])
+
+        if poll.type == Poll.QUIZ and poll.correct_option_id is not None:
+            if not (2 <= len(options) <= 10):
+                return  # silently skip malformed polls rather than crashing the batch
+            questions.append({
+                "question": _clean_poll_text(poll.question),
+                "options": [_clean_poll_text(o) for o in options],
+                "correct_index": poll.correct_option_id, "explanation": "",
+            })
+            await _oq_update_progress(context, msg.chat_id)
+            return
+
+        pending_id = str(msg.message_id)
+        context.user_data.setdefault('oq_pending_polls', {})[pending_id] = {"question": poll.question, "options": options}
+        pick_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"{i + 1}. {_clean_poll_text(o)[:30]}", callback_data=f"oqpollcorrect_{pending_id}_{i}")]
+            for i, o in enumerate(options)
+        ])
+        await msg.reply_text("Which option is correct for this one?", reply_markup=pick_keyboard)
+    except Exception as e:
+        logger.warning(f"handle_oq_forwarded_poll error (collection preserved): {e}")
+
+
+async def oq_poll_correct_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, pending_id, idx = query.data.split('_', 2)
+        pending = context.user_data.get('oq_pending_polls', {}).pop(pending_id, None)
+        if not pending:
+            await query.edit_message_text("Expired — forward that poll again.")
+            return OQ_COLLECT
+        context.user_data.setdefault('oq_questions', []).append({
+            "question": _clean_poll_text(pending['question']),
+            "options": [_clean_poll_text(o) for o in pending['options']],
+            "correct_index": int(idx), "explanation": "",
+        })
+        count = len(context.user_data['oq_questions'])
+        keyboard = cancel_keyboard([[InlineKeyboardButton("✅ Done — Finish Quiz", callback_data="oqdone_forward")]])
+        await query.edit_message_text(f"➕ {count} question(s) added so far. Forward more, or tap Done.", reply_markup=keyboard)
+    except Exception as e:
+        logger.warning(f"oq_poll_correct_choice error: {e}")
+    return OQ_COLLECT
+
+
+async def oq_forward_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['oq_collecting'] = False
+    if not context.user_data.get('oq_questions'):
+        await query.edit_message_text("You haven't forwarded any polls yet — forward at least one, then tap Done.")
+        return OQ_COLLECT
+    return await oq_finalize(update, context, query=query)
+
+
+async def oq_receive_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Accumulates bulk text across MULTIPLE messages (a single Telegram message is
+    capped at ~4096 characters, so 500 questions pasted at once would either be
+    silently truncated or refused by the Telegram client) — send Q/A blocks in as many
+    messages as needed, then tap ✅ Done."""
+    buffer = context.user_data.get('oq_bulk_text', '')
+    buffer = (buffer + "\n\n" + (update.message.text or "")).strip()
+    context.user_data['oq_bulk_text'] = buffer
+
+    try:
+        questions = parse_bulk_questions(buffer)
+    except Exception as e:
+        logger.warning(f"parse_bulk_questions error: {e}")
+        questions = []
+
+    context.user_data['oq_questions'] = questions
+    keyboard = cancel_keyboard([[InlineKeyboardButton("✅ Done — Finish Quiz", callback_data="oqdone_bulk")]])
+    if not questions:
+        await update.message.reply_text(
+            "Couldn't find any valid questions yet — check the format above. Send more text, or Cancel.",
+            reply_markup=cancel_keyboard(),
+        )
+    else:
+        await update.message.reply_text(
+            f"➕ {len(questions)} question(s) parsed so far. Send more, or tap ✅ Done when finished.",
+            reply_markup=keyboard,
+        )
+    return OQ_BULK
+
+
+async def oq_bulk_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not context.user_data.get('oq_questions'):
+        await query.edit_message_text("No valid questions parsed yet — send your Q/A text first.")
+        return OQ_BULK
+    return await oq_finalize(update, context, query=query)
+
+
+async def oq_finalize(update: Update, context: ContextTypes.DEFAULT_TYPE, query=None):
+    try:
+        user = update.effective_user
+        questions = context.user_data.get('oq_questions', [])
+        title = context.user_data.get('oq_title', 'Quiz')
+        timer = context.user_data.get('oq_timer', 0)
+        quiz_id = save_quiz(user.id, title, questions, timer_seconds=timer, quiz_type='official',
+                             creator_name=user.first_name or 'Unknown')
+
+        timer_text = f"{timer}s / question" if timer else "No limit"
+        summary = (
+            f"✅ **{stylize('Official Quiz Ready')}**\n_{FONT_STYLE}_\n\n"
+            f"📝 **Title:** {title}\n"
+            f"⏱ **Timer:** {timer_text}\n"
+            f"🆔 **Quiz ID:** `{quiz_id}`\n"
+            f"👤 **Creator:** {user.first_name} (`{user.id}`)\n"
+            f"❓ **Questions:** {len(questions)}\n\n"
+            f"Anyone can start it in a group or DM with `/startquiz {quiz_id}`. In a group, "
+            f"it opens a waiting room until 2 people tap ✅ I Am Ready.\n"
+            f"Open **🛠 Manage / Status** any time to add a description, edit it, or see who's played it."
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("▶️ Start Here", callback_data=f"oqstart_{quiz_id}")],
+            [InlineKeyboardButton("🛠 Manage / Status", callback_data=f"stmanage_{quiz_id}"),
+             InlineKeyboardButton("📤 Share Quiz ID", callback_data=f"oqshare_{quiz_id}")],
+            [InlineKeyboardButton("🔙 Back to Tools", callback_data="open_tools")],
+        ])
+        if query:
+            await query.edit_message_text(summary, parse_mode="Markdown", reply_markup=keyboard)
+        else:
+            await update.message.reply_text(summary, parse_mode="Markdown", reply_markup=keyboard)
+    except Exception as e:
+        logger.error(f"oq_finalize error: {e}")
+        target = query.edit_message_text if query else update.message.reply_text
+        await target("⚠️ Something went wrong saving the quiz — your questions are still in this session, please tap Done again.")
+        return OQ_COLLECT if context.user_data.get('oq_collecting') is not None else OQ_BULK
+    finally:
+        for k in ('oq_questions', 'oq_title', 'oq_timer', 'oq_collecting', 'oq_pending_polls',
+                  'oq_progress_msg_id', 'oq_progress_last_edit', 'oq_bulk_text'):
+            context.user_data.pop(k, None)
+    return ConversationHandler.END
+
+
+async def oqshare_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    quiz_id = query.data.replace("oqshare_", "")
+    quiz = get_quiz_meta(int(quiz_id)) if quiz_id.isdigit() else None
+    if not quiz:
+        await query.answer("Quiz not found.", show_alert=True)
+        return
+    timer_text = f"{quiz['timer_seconds']}s / question" if quiz['timer_seconds'] else "No limit"
+    creator_mention = f"[{quiz['creator_name'] or 'Unknown'}](tg://user?id={quiz['user_id']})"
+    share_text = (
+        f"🧩 **{stylize('Quiz Invite')}**\n\n📝 {quiz['title']}\n"
+        + (f"💬 {quiz['description']}\n" if quiz.get('description') else "") +
+        f"🆔 Quiz ID: `{quiz['id']}`\n"
+        f"👤 By: {creator_mention} (`{quiz['user_id']}`)\n"
+        f"⏱ {timer_text} · ❓ {len(quiz['questions'])} questions\n\n"
+        f"Start it in any group or DM by sending:\n`/startquiz {quiz['id']}`"
+    )
+    await context.bot.send_message(query.message.chat_id, share_text, parse_mode="Markdown")
+
+
+# --- Live quiz session engine (in-memory per running process; the quiz itself and
+# every finished leaderboard are always saved to the database, so nothing about the
+# quiz content or results is ever lost even if the bot restarts mid-session). ---
+async def start_live_quiz(bot, application, chat_id, quiz_id, started_by_id, started_by_name):
+    quiz = get_quiz_meta(quiz_id)
+    if not quiz:
+        await bot.send_message(chat_id, "❌ Quiz not found — check the Quiz ID.")
+        return
+    if not quiz['questions']:
+        await bot.send_message(chat_id, "❌ This quiz has no questions.")
+        return
+    live = application.bot_data.setdefault('live_quizzes', {})
+    existing = live.get(chat_id)
+    if existing and not existing.get('finished', True):
+        await bot.send_message(chat_id, "⚠️ A quiz is already running in this chat — stop it first.")
+        return
+
+    creator = get_user(quiz['user_id'])  # the quiz AUTHOR's tag/description/option-style — applied
+    # to every question in this run, same as everywhere else the quiz is delivered.
+    session = {
+        "quiz_id": quiz_id, "questions": quiz['questions'], "title": quiz['title'],
+        "timer": quiz['timer_seconds'], "index": 0, "paused": False, "stopped": False,
+        "undo_requested": False, "finished": False,
+        "creator_id": started_by_id, "creator_name": started_by_name,
+        "author_id": quiz['user_id'], "author_name": quiz['creator_name'] or "Unknown",
+        "author_tag": creator['tag'], "author_desc_tag": creator['description_tag'],
+        "author_option_style": creator['option_style'],
+        "poll_map": {}, "poll_sent_at": {}, "scores": {}, "last_poll_msg_id": None,
+        "current_poll_id": None, "answers_this_question": 0, "consecutive_silent": 0,
+    }
+    live[chat_id] = session
+
+    author_mention = f"[{session['author_name']}](tg://user?id={session['author_id']})"
+    timer_text = f"{quiz['timer_seconds']}s / question" if quiz['timer_seconds'] else "No limit"
+    ctrl_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏸ Pause", callback_data=f"oqctl_pause_{chat_id}"),
+         InlineKeyboardButton("▶️ Resume", callback_data=f"oqctl_resume_{chat_id}")],
+        [InlineKeyboardButton("↩️ Undo Last", callback_data=f"oqctl_undo_{chat_id}"),
+         InlineKeyboardButton("⏹ Stop", callback_data=f"oqctl_stop_{chat_id}")],
+    ])
+    await bot.send_message(
+        chat_id,
+        f"🚦 **{stylize('Official Quiz — Live')}**\n📝 {quiz['title']}\n"
+        + (f"💬 {quiz['description']}\n" if quiz.get('description') else "") +
+        f"👤 By: {author_mention} (`{session['author_id']}`)\n"
+        f"⏱ {timer_text} · ❓ {len(quiz['questions'])} questions\n\n"
+        f"Only {started_by_name} or a chat admin can control this.",
+        parse_mode="Markdown", reply_markup=ctrl_keyboard,
+    )
+    application.create_task(_run_live_quiz_loop(bot, application, chat_id))
+
+
+# ==========================================
+# 🚪 LOBBY — starting an Official Quiz in a GROUP waits for at least 2 people to tap
+# "I Am Ready" before any question is fired (DMs skip this — no lobby needed for one
+# person). Mirrors how popular live-quiz bots avoid firing into an empty room.
+# ==========================================
+LOBBY_MIN_READY = 2
+LOBBY_TIMEOUT_SECONDS = 10 * 60  # never wait forever for players who never show up
+
+
+def _lobby_view(chat_id, lobby):
+    ready_count = len(lobby['ready_users'])
+    quiz = lobby['quiz']
+    timer_text = f"{quiz['timer_seconds']}s / question" if quiz['timer_seconds'] else "No limit"
+    author_mention = f"[{quiz['creator_name'] or 'Unknown'}](tg://user?id={quiz['user_id']})"
+    text = (
+        f"🚪 **{stylize('Waiting Room')}**\n📝 {quiz['title']}\n"
+        + (f"💬 {quiz['description']}\n" if quiz.get('description') else "") +
+        f"👤 By: {author_mention} (`{quiz['user_id']}`)\n"
+        f"⏱ {timer_text} · ❓ {len(quiz['questions'])} questions\n\n"
+        f"Waiting for at least {LOBBY_MIN_READY} players — tap below when you're ready.\n"
+        f"✅ Ready: {ready_count}/{LOBBY_MIN_READY}"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"✅ I Am Ready ({ready_count})", callback_data=f"oqready_{chat_id}")],
+        [InlineKeyboardButton("⏹ Cancel", callback_data=f"oqreadycancel_{chat_id}")],
+    ])
+    return text, keyboard
+
+
+async def initiate_live_quiz(bot, application, chat_id, chat_type, quiz_id, requested_by_id, requested_by_name):
+    """Entry point for both /startquiz and the ▶️ Start Here button. In a group this
+    opens the ready-check lobby instead of firing questions immediately; in a DM (a
+    solo quiz for one person) the lobby would just be a pointless extra tap, so it
+    starts right away."""
+    quiz = get_quiz_meta(quiz_id)
+    if not quiz:
+        await bot.send_message(chat_id, "❌ Quiz not found — check the Quiz ID.")
+        return
+    if not quiz['questions']:
+        await bot.send_message(chat_id, "❌ This quiz has no questions.")
+        return
+
+    if chat_type not in ("group", "supergroup"):
+        await start_live_quiz(bot, application, chat_id, quiz_id, requested_by_id, requested_by_name)
+        return
+
+    live = application.bot_data.setdefault('live_quizzes', {})
+    existing = live.get(chat_id)
+    if existing and not existing.get('finished', True):
+        await bot.send_message(chat_id, "⚠️ A quiz is already running in this chat — stop it first.")
+        return
+    lobbies = application.bot_data.setdefault('quiz_lobbies', {})
+    if chat_id in lobbies:
+        await bot.send_message(chat_id, "⚠️ A waiting room is already open in this chat — tap ✅ I Am Ready above.")
+        return
+
+    lobbies[chat_id] = {
+        "quiz": quiz, "quiz_id": quiz_id, "requested_by_id": requested_by_id,
+        "requested_by_name": requested_by_name, "ready_users": set(), "message_id": None,
+    }
+    text, keyboard = _lobby_view(chat_id, lobbies[chat_id])
+    msg = await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=keyboard)
+    lobbies[chat_id]["message_id"] = msg.message_id
+    application.create_task(_lobby_timeout_watch(bot, application, chat_id))
+
+
+async def _lobby_timeout_watch(bot, application, chat_id):
+    await asyncio.sleep(LOBBY_TIMEOUT_SECONDS)
+    lobbies = application.bot_data.get('quiz_lobbies', {})
+    if chat_id in lobbies:
+        lobbies.pop(chat_id, None)
+        try:
+            await bot.send_message(chat_id, "🚪 Waiting room closed — not enough players joined in time. Start it again anytime.")
+        except Exception as e:
+            logger.warning(f"Lobby timeout notice failed (non-fatal): {e}")
+
+
+async def lobby_ready_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat_id = int(query.data.replace("oqready_", ""))
+    lobbies = context.application.bot_data.get('quiz_lobbies', {})
+    lobby = lobbies.get(chat_id)
+    if not lobby:
+        await query.answer("This waiting room has closed.", show_alert=True)
+        return
+    lobby['ready_users'].add(query.from_user.id)
+    await query.answer("✅ You're marked ready!")
+
+    if len(lobby['ready_users']) >= LOBBY_MIN_READY:
+        lobbies.pop(chat_id, None)
+        try:
+            await query.edit_message_text(f"✅ {LOBBY_MIN_READY}+ players ready — starting now!")
+        except Exception as e:
+            logger.warning(f"lobby_ready_callback edit failed (non-fatal): {e}")
+        await start_live_quiz(context.bot, context.application, chat_id, lobby['quiz_id'],
+                               lobby['requested_by_id'], lobby['requested_by_name'])
+        return
+
+    text, keyboard = _lobby_view(chat_id, lobby)
+    try:
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    except Exception as e:
+        logger.warning(f"lobby_ready_callback edit failed (non-fatal): {e}")
+
+
+async def lobby_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat_id = int(query.data.replace("oqreadycancel_", ""))
+    lobbies = context.application.bot_data.get('quiz_lobbies', {})
+    lobby = lobbies.get(chat_id)
+    if not lobby:
+        await query.answer("Already closed.", show_alert=True)
+        return
+    is_admin = await is_chat_admin(update, context)
+    if query.from_user.id != lobby['requested_by_id'] and not is_admin:
+        await query.answer("Only whoever started this, or a chat admin, can cancel it.", show_alert=True)
+        return
+    lobbies.pop(chat_id, None)
+    await query.answer("Cancelled.")
+    try:
+        await query.edit_message_text("⏹ Waiting room cancelled.")
+    except Exception as e:
+        logger.warning(f"lobby_cancel_callback edit failed (non-fatal): {e}")
+
+
+# A session left "paused" forever (host went AFK, phone died, etc.) used to keep this
+# background task alive indefinitely — a real, silent stuck-loop. Auto-stop after this
+# many seconds of continuous pause instead, so nothing about the bot is ever "stuck".
+MAX_LIVE_QUIZ_PAUSE_SECONDS = 30 * 60
+# If 2 questions in a row get zero answers from anyone, the room is probably empty —
+# auto-pause instead of blindly firing the rest of the quiz into silence.
+SILENT_QUESTIONS_BEFORE_AUTOPAUSE = 2
+
+
+async def _run_live_quiz_loop(bot, application, chat_id):
+    live = application.bot_data.get('live_quizzes', {})
+    session = live.get(chat_id)
+    if not session:
+        return
+    try:
+        while session['index'] < len(session['questions']) and not session['stopped']:
+            paused_elapsed = 0
+            while session['paused'] and not session['stopped']:
+                await asyncio.sleep(1)
+                paused_elapsed += 1
+                if paused_elapsed >= MAX_LIVE_QUIZ_PAUSE_SECONDS:
+                    session['stopped'] = True
+                    try:
+                        await bot.send_message(
+                            chat_id,
+                            "⏹ Auto-stopped — this quiz stayed paused too long without a Resume. "
+                            "Here's the leaderboard for what was played so far.",
+                        )
+                    except Exception as e:
+                        logger.warning(f"Live quiz auto-stop notice failed: {e}")
+                    break
+            if session['stopped']:
+                break
+
+            q = session['questions'][session['index']]
+            question_text = f"Q{session['index'] + 1}. {q['question']}"
+            if session.get('author_tag'):
+                question_text = f"{question_text} 🏷 {session['author_tag']}"
+            explanation = q.get('explanation', '')
+            if session.get('author_desc_tag'):
+                explanation = f"{explanation}\n\n💡 {session['author_desc_tag']}".strip() if explanation else f"💡 {session['author_desc_tag']}"
+            try:
+                msg = await bot.send_poll(
+                    chat_id=chat_id,
+                    question=question_text[:300],
+                    options=apply_option_style(q['options'], session.get('author_option_style', 'plain')),
+                    type=Poll.QUIZ,
+                    correct_option_id=q['correct_index'],
+                    explanation=(explanation[:200] or None),
+                    is_anonymous=False,
+                    open_period=session['timer'] if session['timer'] else None,
+                )
+                session['poll_map'][msg.poll.id] = session['index']
+                session['poll_sent_at'][msg.poll.id] = time.monotonic()
+                session['last_poll_msg_id'] = msg.message_id
+                session['current_poll_id'] = msg.poll.id
+                session['answers_this_question'] = 0
+            except Exception as e:
+                logger.warning(f"Live quiz poll send failed (skipping to next question): {e}")
+                session['current_poll_id'] = None
+
+            session['index'] += 1
+            # A promo message every 5 questions, mid-quiz only — same rule as post_quiz_polls,
+            # so it behaves identically whichever way a quiz was made or is being delivered.
+            if session['index'] % PROMO_EVERY_N_QUESTIONS == 0 and session['index'] < len(session['questions']):
+                await send_promo_message(bot, chat_id)
+
+            wait_seconds = (session['timer'] or 15) + 2
+            elapsed = 0
+            undone = False
+            while elapsed < wait_seconds:
+                if session['stopped']:
+                    break
+                if session.get('undo_requested'):
+                    session['undo_requested'] = False
+                    session['index'] = max(0, session['index'] - 1)  # re-ask the question just posted
+                    undone = True
+                    break
+                if not session['paused']:
+                    elapsed += 1
+                await asyncio.sleep(1)
+            if undone:
+                try:
+                    if session['last_poll_msg_id']:
+                        await bot.stop_poll(chat_id, session['last_poll_msg_id'])
+                except Exception:
+                    pass
+            elif not session['stopped']:
+                # Nobody answered this question at all — probably means the room emptied
+                # out. Two of these in a row auto-pauses instead of firing blindly into
+                # silence; a real answer at any point resets the streak back to zero.
+                if session['answers_this_question'] == 0:
+                    session['consecutive_silent'] += 1
+                    if session['consecutive_silent'] >= SILENT_QUESTIONS_BEFORE_AUTOPAUSE:
+                        session['paused'] = True
+                        session['consecutive_silent'] = 0
+                        try:
+                            await bot.send_message(
+                                chat_id,
+                                f"⏸ Auto-paused — the last {SILENT_QUESTIONS_BEFORE_AUTOPAUSE} questions got no "
+                                "answers. Tap ▶️ Resume above whenever you're ready to continue.",
+                            )
+                        except Exception as e:
+                            logger.warning(f"Auto-pause notice failed (non-fatal): {e}")
+                else:
+                    session['consecutive_silent'] = 0
+
+        if not session['stopped']:
+            await _finish_live_quiz(bot, chat_id, application)
+    except Exception as e:
+        # A bug anywhere above must never leave this chat silently stuck thinking a
+        # quiz is still "live" with no loop actually driving it — always clean up and
+        # still show whatever leaderboard data was collected so far.
+        logger.error(f"Live quiz loop crashed for chat {chat_id} — auto-recovering: {e}", exc_info=True)
+        try:
+            await _finish_live_quiz(bot, chat_id, application)
+        except Exception as e2:
+            logger.error(f"Live quiz recovery also failed for chat {chat_id}, forcing cleanup: {e2}")
+            live.pop(chat_id, None)
+
+
+async def _finish_live_quiz(bot, chat_id, application):
+    live = application.bot_data.get('live_quizzes', {})
+    session = live.get(chat_id)
+    if not session or session.get('finished'):
+        return
+    session['finished'] = True
+    if session.get('last_poll_msg_id'):
+        try:
+            await bot.stop_poll(chat_id, session['last_poll_msg_id'])
+        except Exception:
+            pass
+
+    total_questions = len(session['questions'])
+
+    def _sort_key(s):
+        # Rank by score, then accuracy, then average answer speed (faster = better) —
+        # so an exact score tie still resolves to one unambiguous, correct position.
+        avg_ms = (s['total_time_ms'] / s['answered']) if s['answered'] else float('inf')
+        accuracy = (s['correct'] / s['answered']) if s['answered'] else 0
+        return (-s['score'], -accuracy, avg_ms)
+
+    ranking = sorted(session['scores'].values(), key=_sort_key)
+    if ranking:
+        medals = ["🥇", "🥈", "🥉"]
+        lines = []
+        for i, s in enumerate(ranking[:20]):
+            avg_sec = round((s['total_time_ms'] / s['answered']) / 1000, 1) if s['answered'] else 0.0
+            accuracy = round((s['correct'] / s['answered']) * 100, 1) if s['answered'] else 0.0
+            rank_tag = medals[i] if i < 3 else f"{i + 1}."
+            lines.append(
+                f"{rank_tag} {s['name']} — `{s['user_id']}`\n"
+                f"      {s['score']} pts · ✅ {s['correct']} ❌ {s['wrong']} · 🎯 {accuracy}% acc · ⏱ {avg_sec}s avg"
+            )
+        board_text = (
+            f"🏆 **{stylize('Official Quiz Leaderboard')}** — {session['title']}\n"
+            f"_{FONT_STYLE}_\n\n" + "\n".join(lines) +
+            "\n\n👤 User ID is shown next to each name so the host can reach out directly (prizes, verification, etc.)."
+        )
+    else:
+        board_text = f"🏆 **{stylize('Official Quiz Leaderboard')}** — {session['title']}\n\nNo answers were recorded."
+    try:
+        await bot.send_message(chat_id, board_text, parse_mode="Markdown")
+    except Exception as e:
+        logger.warning(f"Live quiz leaderboard send failed: {e}")
+
+    for s in ranking:
+        avg_ms = int(s['total_time_ms'] / s['answered']) if s['answered'] else 0
+        try:
+            save_quiz_result(
+                session['quiz_id'], chat_id, s['user_id'], s['name'], s['score'], s['correct'],
+                wrong_count=s['wrong'], total_questions=total_questions, avg_time_ms=avg_ms,
+            )
+        except Exception as e:
+            logger.warning(f"save_quiz_result failed for user {s['user_id']}: {e}")
+    live.pop(chat_id, None)
+
+
+async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ans = update.poll_answer
+    if not ans.option_ids:
+        return  # user retracted their answer
+    live = context.application.bot_data.get('live_quizzes', {})
+    for chat_id, session in live.items():
+        if ans.poll_id in session['poll_map']:
+            q_index = session['poll_map'][ans.poll_id]
+            question = session['questions'][q_index]
+            correct = question['correct_index'] in ans.option_ids
+
+            # Telegram doesn't timestamp poll_answer updates, so response time is
+            # measured as (now − when we sent that poll) — accurate to within normal
+            # network/delivery latency, and clamped to the question's own time window
+            # so a stray late update can never distort the average.
+            sent_at = session.get('poll_sent_at', {}).get(ans.poll_id)
+            timer_cap_ms = ((session['timer'] or 15) + 2) * 1000
+            elapsed_ms = int((time.monotonic() - sent_at) * 1000) if sent_at else 0
+            elapsed_ms = max(0, min(elapsed_ms, timer_cap_ms))
+
+            entry = session['scores'].setdefault(
+                ans.user.id,
+                {"user_id": ans.user.id, "name": ans.user.first_name or "Player", "score": 0,
+                 "correct": 0, "wrong": 0, "total_time_ms": 0, "answered": 0},
+            )
+            entry['name'] = ans.user.first_name or entry['name']
+            entry['answered'] += 1
+            entry['total_time_ms'] += elapsed_ms
+            if correct:
+                entry['score'] += 10
+                entry['correct'] += 1
+            else:
+                entry['wrong'] += 1
+
+            # Feeds the auto-pause-on-silence check in _run_live_quiz_loop — only counts
+            # toward the *current* question, so a late answer to an older one can't
+            # wrongly mark the current question as "answered".
+            if ans.poll_id == session.get('current_poll_id'):
+                session['answers_this_question'] = session.get('answers_this_question', 0) + 1
+            break
+
+
+async def oqstart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    quiz_id_str = query.data.replace("oqstart_", "")
+    if not quiz_id_str.isdigit():
+        return
+    user = query.from_user
+    await initiate_live_quiz(context.bot, context.application, query.message.chat_id, query.message.chat.type,
+                              int(quiz_id_str), user.id, user.first_name or "Host")
+
+
+async def startquiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /startquiz QUIZ_ID")
+        return
+    user = update.effective_user
+    await initiate_live_quiz(context.bot, context.application, update.effective_chat.id, update.effective_chat.type,
+                              int(context.args[0]), user.id, user.first_name or "Host")
+
+
+async def oq_control_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    _, action, chat_id_str = query.data.split('_', 2)
+    chat_id = int(chat_id_str)
+    live = context.application.bot_data.get('live_quizzes', {})
+    session = live.get(chat_id)
+    if not session:
+        await query.answer("This quiz has already ended.", show_alert=True)
+        return
+
+    user_id = query.from_user.id
+    is_admin = await is_chat_admin(update, context)
+    if user_id != session['creator_id'] and not is_admin:
+        await query.answer("Only the quiz creator or a chat admin can control this.", show_alert=True)
+        return
+
+    if action == "pause":
+        session['paused'] = True
+        await query.answer("⏸ Paused")
+    elif action == "resume":
+        session['paused'] = False
+        await query.answer("▶️ Resumed")
+    elif action == "stop":
+        session['stopped'] = True
+        await query.answer("⏹ Stopping...")
+        await _finish_live_quiz(context.bot, chat_id, context.application)
+    elif action == "undo":
+        session['undo_requested'] = True
+        await query.answer("↩️ Undoing last question...")
+    else:
+        await query.answer()
+
+
+# ==========================================
+# 🏷️ TAG / REGENERATE / REDEEM / STORE / DEFAULT
+# ==========================================
+async def settag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /settag Your Tag Here")
+        return
+    tag = " ".join(context.args)[:60]
+    set_user_field(update.effective_user.id, 'tag', tag)
+    await update.message.reply_text(f"🏷 Tag set: {tag}", reply_markup=back_to_tools_keyboard())
+
+
+async def setdescription_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /setdescription Your Tag Here")
+        return
+    tag = " ".join(context.args)[:60]
+    set_user_field(update.effective_user.id, 'description_tag', tag)
+    await update.message.reply_text(f"💡 Description tag set: {tag}", reply_markup=back_to_tools_keyboard())
+
+
+async def do_regenerate(bot, chat_id, user_id):
+    last = get_last_source(user_id)
+    if not last:
+        await bot.send_message(chat_id, "Nothing to regenerate yet — create a quiz first.")
+        return
+    user = get_user(user_id)
+    remaining = user['question_limit'] - user['questions_used']
+    if remaining <= 0:
+        await bot.send_message(chat_id, "You've used your full quota. Use /redeem CODE to add more.")
+        return
+
+    daily_left = get_daily_ai_remaining(user_id)
+    if daily_left is not None:
+        if daily_left <= 0:
+            await bot.send_message(
+                chat_id,
+                f"⏳ Aaj ka {DAILY_AI_QUESTION_LIMIT}-question AI limit khatam ho gaya — UTC midnight ke baad reset hoga."
+            )
+            return
+        remaining = min(remaining, daily_left)
+
+    count = min(last['count'], remaining)
+    try:
+        questions = await asyncio.to_thread(generate_mcqs_sync, user_id, last['parts'], count, last['difficulty'], last['language'])
+    except RuntimeError as e:
+        await bot.send_message(chat_id, f"⚠️ {e}")
+        return
+    sent = await post_quiz_polls(bot, chat_id, questions, user_tag=user['tag'],
+                                  explanation_tag=user['description_tag'], option_style=user['option_style'])
+    increment_questions_used(user_id, sent)
+    record_daily_ai_usage(user_id, sent)
+    await bot.send_message(chat_id, f"✅ Done — {sent} fresh question(s) posted.")
+
+
+async def regenerate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await do_regenerate(context.bot, update.effective_chat.id, update.effective_user.id)
+
+
+async def redeem_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /redeem CODE")
+        return
+    result = redeem_code(update.effective_user.id, context.args[0].strip().upper())
+    await update.message.reply_text(result)
+
+
+# ==========================================
+# 🔤 OPTION STYLE — how MCQ options are labelled (plain / A) B) C) D) / 1) 2) 3) 4))
+# Every user (and the owner) sets their own — applied everywhere a quiz is posted:
+# AI-generated (post_quiz_polls), Official Quiz live (_run_live_quiz_loop), and
+# single-poll conversions (create_quiz_from_poll_data).
+# ==========================================
+def _option_style_keyboard(current: str):
+    def label(key, text):
+        return f"✅ {text}" if current == key else text
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label("plain", OPTION_STYLE_LABELS["plain"]), callback_data="optstyle_plain")],
+        [InlineKeyboardButton(label("abcd", OPTION_STYLE_LABELS["abcd"]), callback_data="optstyle_abcd")],
+        [InlineKeyboardButton(label("numeric", OPTION_STYLE_LABELS["numeric"]), callback_data="optstyle_numeric")],
+    ])
+
+
+async def optionstyle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_user.id)
+    await update.message.reply_text(
+        "🔤 **Option Style** — how answer options are labelled in every quiz you make:",
+        parse_mode="Markdown", reply_markup=_option_style_keyboard(user['option_style']),
+    )
+
+
+async def optionstyle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    style = query.data.replace("optstyle_", "")
+    if style not in OPTION_STYLE_LABELS:
+        return
+    set_user_field(update.effective_user.id, 'option_style', style)
+    await query.edit_message_text(
+        f"🔤 **Option Style** — set to **{OPTION_STYLE_LABELS[style]}**. Applies from your next quiz onward.",
+        parse_mode="Markdown", reply_markup=_option_style_keyboard(style),
+    )
+
+
+# ==========================================
+# 🎁 OWNER: free/unlimited AI access for specific people (friends, testers, etc.)
+# ==========================================
+async def freeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("⛔ Owner only.")
+        return
+    if not context.args or not context.args[0].lstrip('-').isdigit():
+        await update.message.reply_text(
+            "Usage:\n`/freeuser <user_id>` — make them unlimited (no 200/day AI cap)\n"
+            "`/freeuser <user_id> off` — put the daily cap back",
+            parse_mode="Markdown",
+        )
+        return
+    target_id = int(context.args[0])
+    turn_off = len(context.args) > 1 and context.args[1].lower() == "off"
+    set_ai_unlimited(target_id, not turn_off)
+    if turn_off:
+        await update.message.reply_text(f"↩️ `{target_id}` is back on the normal {DAILY_AI_QUESTION_LIMIT}/day AI limit.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"🎁 `{target_id}` now has **unlimited** AI generation — no daily cap.", parse_mode="Markdown")
+
+
+# ==========================================
+# 📣 OWNER: the promo message shown every 5 questions in every quiz
+# ==========================================
+async def setpromo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("⛔ Owner only.")
+        return
+    parts = update.message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        current = get_bot_setting("promo_text", "")
+        await update.message.reply_text(
+            "Usage: `/setpromo Your promo text/link here`\n`/setpromo off` — turn it off\n\n"
+            f"Current: {current or '(not set — no promo is shown)'}",
+            parse_mode="Markdown",
+        )
+        return
+    text = parts[1].strip()
+    if text.lower() == "off":
+        set_bot_setting("promo_text", "")
+        await update.message.reply_text("📣 Promo message turned off.")
+        return
+    set_bot_setting("promo_text", text[:500])
+    await update.message.reply_text(f"📣 Promo set — will appear every {PROMO_EVERY_N_QUESTIONS} questions in every quiz:\n\n{text[:500]}")
+
+
+async def addcode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("⛔ Owner only.")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: /addcode CODE BONUS_QUESTIONS [MAX_USES] [VALIDITY_DAYS]\n"
+            "MAX_USES 0 = unlimited redemptions. VALIDITY_DAYS omitted = never expires."
+        )
+        return
+    code = context.args[0].strip().upper()
+    try:
+        bonus = int(context.args[1])
+        max_uses = int(context.args[2]) if len(context.args) > 2 else 0
+        validity_days = int(context.args[3]) if len(context.args) > 3 else 0
+    except ValueError:
+        await update.message.reply_text("BONUS_QUESTIONS, MAX_USES and VALIDITY_DAYS must be numbers.")
+        return
+    expires_at = (datetime.utcnow() + timedelta(days=validity_days)).isoformat() if validity_days > 0 else None
+    conn = db_connect()
+    cur = conn.cursor()
+    upsert(cur, "redeem_codes", {"code": code},
+           {"bonus_questions": bonus, "max_uses": max_uses, "used_count": 0, "expires_at": expires_at})
+    conn.commit()
+    conn.close()
+    validity_txt = f"expires in {validity_days} day(s)" if expires_at else "never expires"
+    await update.message.reply_text(
+        f"✅ Code {code} created: +{bonus} questions, max uses: {max_uses or '∞'}, {validity_txt}"
+    )
+
+
+def get_top_solvers(limit: int = 10) -> list:
+    """Ranks users by total correctly-answered questions across every finished
+    Official Quiz session saved in quiz_results (the only place per-question
+    correctness is tracked). Also rolls up wrong-count/accuracy so every place
+    this list is shown can display user_id + accuracy, not just a raw count."""
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT user_id, MAX(user_name), SUM(correct_count), SUM(wrong_count) "
+        "FROM quiz_results GROUP BY user_id ORDER BY SUM(correct_count) DESC LIMIT ?",
+        (limit,)
+    )
+    rows = cur.fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        correct, wrong = r[2] or 0, r[3] or 0
+        total = correct + wrong
+        accuracy = round((correct / total) * 100, 1) if total else 0.0
+        out.append({"user_id": r[0], "user_name": r[1] or "Unknown", "total_correct": correct,
+                     "total_wrong": wrong, "accuracy": accuracy})
+    return out
+
+
+async def topusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    top = get_top_solvers(10)
+    if not top:
+        await update.message.reply_text("No quiz results yet — leaderboard fills in as people play Official Quizzes.")
+        return
+    medals = ["🥇", "🥈", "🥉"] + ["▫️"] * 7
+    lines = [f"🏆 **{stylize('Top 10 — Most Questions Solved')}**\n_{FONT_STYLE}_\n"]
+    for i, u in enumerate(top):
+        lines.append(
+            f"{medals[i]} {u['user_name']} — `{u['user_id']}`\n"
+            f"      {u['total_correct']} correct · {u['total_wrong']} wrong · {u['accuracy']}% accuracy"
+        )
+    lines.append("\n_Tip: try_ `/leaderboard` _for per-group Points / Accuracy / Today views._")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ==========================================
+# 🏆 /leaderboard — multi-mode leaderboard (Points · Accuracy · Today)
+# Scoped to the current group when run in one; global (all chats) in DM.
+# Every mode always shows user_id next to the name, per-quiz-result, so a host
+# can identify/contact any participant directly.
+# ==========================================
+def _leaderboard_rows(chat_id, scope: str = "all"):
+    """Aggregates quiz_results per user, optionally scoped to one chat_id and/or to
+    'today' (UTC). Filtering 'today' in Python (not SQL) keeps this correct on both
+    SQLite and Postgres without relying on either engine's date functions."""
+    conn = db_connect()
+    cur = conn.cursor()
+    if chat_id is not None:
+        cur.execute(
+            "SELECT user_id, user_name, score, correct_count, wrong_count, finished_at "
+            "FROM quiz_results WHERE chat_id=? ORDER BY id DESC LIMIT 5000",
+            (chat_id,)
+        )
+    else:
+        cur.execute(
+            "SELECT user_id, user_name, score, correct_count, wrong_count, finished_at "
+            "FROM quiz_results ORDER BY id DESC LIMIT 5000"
+        )
+    rows = cur.fetchall()
+    conn.close()
+
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    agg = {}
+    for user_id, name, score, correct, wrong, finished_at in rows:
+        if scope == "today" and not (finished_at or "").startswith(today_str):
+            continue
+        e = agg.setdefault(user_id, {"user_id": user_id, "name": name or "Unknown",
+                                      "points": 0, "correct": 0, "wrong": 0})
+        e["name"] = name or e["name"]
+        e["points"] += score or 0
+        e["correct"] += correct or 0
+        e["wrong"] += wrong or 0
+    return list(agg.values())
+
+
+def build_leaderboard_text(chat_id, mode: str = "points") -> str:
+    rows = _leaderboard_rows(chat_id, scope="today" if mode == "today" else "all")
+    if mode == "accuracy":
+        rows = [r for r in rows if (r["correct"] + r["wrong"]) >= 3]  # needs a few attempts to be meaningful
+        rows.sort(key=lambda r: (r["correct"] / (r["correct"] + r["wrong"])), reverse=True)
+        title = "🎯 Accuracy Leaderboard (min. 3 answers)"
+    elif mode == "today":
+        rows.sort(key=lambda r: -r["points"])
+        title = f"📅 Today's Leaderboard ({datetime.utcnow().strftime('%Y-%m-%d')} UTC)"
+    else:
+        rows.sort(key=lambda r: -r["points"])
+        title = "🏆 Points Leaderboard"
+
+    if not rows:
+        return f"**{stylize(title)}**\n\nNo quiz results yet here."
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = [f"**{stylize(title)}**\n_{FONT_STYLE}_\n"]
+    for i, r in enumerate(rows[:10]):
+        total = r["correct"] + r["wrong"]
+        accuracy = round((r["correct"] / total) * 100, 1) if total else 0.0
+        rank_tag = medals[i] if i < 3 else f"{i + 1}."
+        lines.append(
+            f"{rank_tag} {r['name']} — `{r['user_id']}`\n"
+            f"      {r['points']} pts · ✅ {r['correct']} ❌ {r['wrong']} · 🎯 {accuracy}%"
+        )
+    return "\n".join(lines)
+
+
+def _leaderboard_mode_keyboard(chat_id):
+    tag = "g" if chat_id is not None else "dm"
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🏆 Points", callback_data=f"lbmode_points_{tag}"),
+        InlineKeyboardButton("🎯 Accuracy", callback_data=f"lbmode_accuracy_{tag}"),
+        InlineKeyboardButton("📅 Today", callback_data=f"lbmode_today_{tag}"),
+    ]])
+
+
+async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    chat_id = chat.id if chat.type in ("group", "supergroup") else None
+    text = build_leaderboard_text(chat_id, "points")
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=_leaderboard_mode_keyboard(chat_id))
+
+
+async def leaderboard_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, mode, tag = query.data.split("_", 2)
+    except ValueError:
+        return
+    chat_id = query.message.chat_id if tag == "g" else None
+    text = build_leaderboard_text(chat_id, mode)
+    try:
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=_leaderboard_mode_keyboard(chat_id))
+    except Exception as e:
+        logger.warning(f"leaderboard_mode_callback edit failed (non-fatal): {e}")
+
+
+async def granttop10_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only: grants the current top-10 solvers a bonus to their quota — the
+    reward for topping the leaderboard, not a permanent unlimited bypass."""
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("⛔ Owner only.")
+        return
+    bonus = 100
+    if context.args:
+        try:
+            bonus = max(100, int(context.args[0]))
+        except ValueError:
+            await update.message.reply_text("Usage: /granttop10 [BONUS_QUESTIONS] — must be a number, minimum 100.")
+            return
+    top = get_top_solvers(10)
+    if not top:
+        await update.message.reply_text("No quiz results yet — nobody to reward.")
+        return
+    rewarded = []
+    for u in top:
+        increment_question_limit(u['user_id'], bonus)
+        rewarded.append(u['user_name'])
+        try:
+            await context.bot.send_message(
+                chat_id=u['user_id'],
+                text=f"🏆 You're in the Top 10 leaderboard! +{bonus} questions added to your quota. Keep it up!",
+            )
+        except Exception as e:
+            logger.warning(f"Couldn't DM top-10 reward to {u['user_id']}: {e}")
+    await update.message.reply_text(f"✅ Granted +{bonus} questions to {len(rewarded)} top user(s): " + ", ".join(rewarded))
+
+
+async def broadcast_to_all(bot, text: str) -> tuple:
+    """Sends text to every tracked group AND every user who has ever /start'ed the
+    bot (DM). Returns (success_count, fail_count). Small delay between sends to stay
+    well under Telegram's flood limits on a big broadcast."""
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT group_id FROM groups")
+    group_ids = [r[0] for r in cur.fetchall()]
+    cur.execute("SELECT user_id FROM users")
+    user_ids = [r[0] for r in cur.fetchall()]
+    conn.close()
+
+    ok, fail = 0, 0
+    for chat_id in group_ids + user_ids:
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+            ok += 1
+        except Exception as e:
+            fail += 1
+            logger.warning(f"Broadcast failed for {chat_id}: {e}")
+        await asyncio.sleep(0.05)
+    return ok, fail
+
+
+async def broadcastcode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only: announces an existing redeem code to every group/channel the bot
+    is in, and DMs every user who has started the bot."""
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("⛔ Owner only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /broadcastcode CODE")
+        return
+    code = context.args[0].strip().upper()
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT bonus_questions FROM redeem_codes WHERE code = ?", (code,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        await update.message.reply_text(f"❌ Code {code} doesn't exist — create it first with /addcode.")
+        return
+    text = f"🎁 **New Redeem Code!**\n\nUse `/redeem {code}` to claim **+{row[0]} bonus questions**!"
+    await update.message.reply_text("📡 Broadcasting…")
+    ok, fail = await broadcast_to_all(context.bot, text)
+    await update.message.reply_text(f"✅ Broadcast done — delivered to {ok} chat(s), failed for {fail}.")
+
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only: broadcasts any free-form message to every group/channel and every
+    user who has started the bot."""
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("⛔ Owner only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /broadcast Your message here")
+        return
+    text = " ".join(context.args)
+    await update.message.reply_text("📡 Broadcasting…")
+    ok, fail = await broadcast_to_all(context.bot, text)
+    await update.message.reply_text(f"✅ Broadcast done — delivered to {ok} chat(s), failed for {fail}.")
+
+
+# ==========================================
+# 📁 QUIZ SETS — /newset, /sets (named folders for organizing saved quizzes)
+# ==========================================
+async def newset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /newset Your Set Name (e.g. `/newset Class 10 History`)", parse_mode="Markdown")
+        return
+    name = " ".join(context.args)[:60]
+    set_id = create_quiz_set(update.effective_user.id, name)
+    await update.message.reply_text(
+        f"📁 Set created: **{name}** (`{set_id}`)\nFile a quiz into it from /mystore → open a quiz → 📁 File in Set.",
+        parse_mode="Markdown",
+    )
+
+
+def _sets_list_view(owner_id: int):
+    sets = get_user_sets(owner_id)
+    if not sets:
+        return "You don't have any sets yet. Create one: `/newset Your Set Name`", back_to_tools_keyboard()
+    rows = [[InlineKeyboardButton(f"📁 {s['name']}", callback_data=f"setview_{s['id']}")] for s in sets[:25]]
+    rows.append([InlineKeyboardButton("🔙 Back to Tools", callback_data="open_tools")])
+    return f"📁 **Your Sets** ({len(sets)}):", InlineKeyboardMarkup(rows)
+
+
+async def sets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text, keyboard = _sets_list_view(update.effective_user.id)
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def set_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    set_id = int(query.data.replace("setview_", ""))
+    set_meta = get_set_meta(set_id)
+    if not set_meta or set_meta['owner_id'] != query.from_user.id:
+        await query.edit_message_text("That set no longer exists.")
+        return
+    quizzes = get_quizzes_in_set(set_id)
+    lines = [f"📁 **{set_meta['name']}** — {len(quizzes)} quiz(zes)\n"]
+    rows = [[InlineKeyboardButton(f"🆔 {q['id']} · {q['title'][:30]}", callback_data=f"stmanage_{q['id']}")] for q in quizzes[:20]]
+    rows.append([InlineKeyboardButton("🗑 Delete This Set (keeps the quizzes)", callback_data=f"setdel_{set_id}")])
+    rows.append([InlineKeyboardButton("🔙 Back to Sets", callback_data="setlist_back")])
+    await query.edit_message_text("\n".join(lines) or "Empty set.", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def set_list_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    text, keyboard = _sets_list_view(query.from_user.id)
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def set_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    set_id = int(query.data.replace("setdel_", ""))
+    ok = delete_quiz_set(set_id, query.from_user.id)
+    text, keyboard = _sets_list_view(query.from_user.id)
+    prefix = "✅ Set deleted (its quizzes are still in /mystore, just unfiled).\n\n" if ok else "❌ Couldn't delete that set.\n\n"
+    await query.edit_message_text(prefix + text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+# ==========================================
+# 📤 LINKED CHANNELS — /setchannel, /mychannels
+# ==========================================
+async def setchannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📤 To link a channel: add me as **admin** there (so I'm allowed to post), then "
+        "forward me any single message from that channel right now.",
+        parse_mode="Markdown", reply_markup=cancel_keyboard(),
+    )
+    return SETCHANNEL_WAIT
+
+
+async def setchannel_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    fwd_chat = getattr(msg, "forward_from_chat", None)
+    if not fwd_chat or fwd_chat.type != "channel":
+        await update.message.reply_text(
+            "That doesn't look like a forward from a channel — forward a message from the "
+            "channel itself (not a group, not a copy-paste), or Cancel.",
+            reply_markup=cancel_keyboard(),
+        )
+        return SETCHANNEL_WAIT
+    try:
+        member = await context.bot.get_chat_member(fwd_chat.id, context.bot.id)
+        if member.status not in ("administrator", "creator"):
+            await update.message.reply_text(
+                f"I'm in **{fwd_chat.title}** but not as admin yet — make me admin there first, then forward again.",
+                parse_mode="Markdown", reply_markup=cancel_keyboard(),
+            )
+            return SETCHANNEL_WAIT
+    except Exception as e:
+        await update.message.reply_text(
+            f"I can't see my own status in that channel yet — make sure I'm added as admin there first. ({e})",
+            reply_markup=cancel_keyboard(),
+        )
+        return SETCHANNEL_WAIT
+    add_user_channel(update.effective_user.id, fwd_chat.id, fwd_chat.title or str(fwd_chat.id))
+    await update.message.reply_text(f"✅ Linked **{fwd_chat.title}** — it'll now show up under 📤 Send to Channel.",
+                                     parse_mode="Markdown")
+    return ConversationHandler.END
+
+
+async def mychannels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    channels = get_user_channels(update.effective_user.id)
+    if not channels:
+        await update.message.reply_text("No channels linked yet — use /setchannel to link one.")
+        return
+    rows = [[InlineKeyboardButton(f"🗑 Remove {c['channel_title']}", callback_data=f"chrm_{c['id']}")] for c in channels]
+    await update.message.reply_text(f"📤 **Linked Channels** ({len(channels)}):", parse_mode="Markdown",
+                                     reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def channel_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    row_id = int(query.data.replace("chrm_", ""))
+    remove_user_channel(query.from_user.id, row_id)
+    channels = get_user_channels(query.from_user.id)
+    if not channels:
+        await query.edit_message_text("No channels linked — use /setchannel to link one.")
+        return
+    rows = [[InlineKeyboardButton(f"🗑 Remove {c['channel_title']}", callback_data=f"chrm_{c['id']}")] for c in channels]
+    await query.edit_message_text(f"📤 **Linked Channels** ({len(channels)}):", parse_mode="Markdown",
+                                   reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def mystore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(*_store_list_view(update.effective_user.id, 0))
+
+
+async def store_button_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    text, keyboard = _store_list_view(query.from_user.id, 0)
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def store_list_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    page = int(query.data.replace("stlist_", ""))
+    text, keyboard = _store_list_view(query.from_user.id, page)
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+STORE_PAGE_SIZE = 10
+
+
+def _store_list_view(user_id: int, page: int = 0):
+    """Paginated quiz list — once you've got more than one page's worth of saved
+    quizzes (Official Quiz or otherwise), ⬅️/➡️ buttons page through them instead of
+    either dumping everything into one giant message or silently dropping anything
+    past the first 25. Tapping any quiz still opens the same Edit/Start/Share/Delete
+    panel (_store_manage_view) regardless of which page it was found on."""
+    quizzes = get_user_quizzes(user_id)
+    if not quizzes:
+        return (
+            "You haven't saved any quizzes yet — create one with /topic, /officialquiz, or by forwarding a poll.",
+            back_to_tools_keyboard(),
+        )
+    total_pages = max(1, (len(quizzes) + STORE_PAGE_SIZE - 1) // STORE_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * STORE_PAGE_SIZE
+    page_quizzes = quizzes[start:start + STORE_PAGE_SIZE]
+
+    rows = [[InlineKeyboardButton(f"🆔 {q['id']} · {q['title'][:30]}", callback_data=f"stmanage_{q['id']}")]
+            for q in page_quizzes]
+
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ Back", callback_data=f"stlist_{page - 1}"))
+        nav.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"stlist_{page + 1}"))
+        rows.append(nav)
+
+    rows.append([InlineKeyboardButton("🔙 Back to Tools", callback_data="open_tools")])
+    text = stylize("Your saved quizzes") + f":\n\n{len(quizzes)} total — tap one to manage it (▶️ Start · ✏️ Edit · 🗑 Delete)."
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _store_manage_view(quiz_id: int):
+    quiz = get_quiz_meta(quiz_id)
+    if not quiz:
+        return "That quiz no longer exists.", back_to_tools_keyboard()
+    timer_text = f"{quiz['timer_seconds']}s / question" if quiz['timer_seconds'] else "No limit"
+    is_official = quiz['quiz_type'] == 'official'
+    type_label = "🤖 Official Quiz" if is_official else "⚡ Quick Quiz"
+    attempts = len(get_quiz_status_rows(quiz_id, limit=1000))
+    creator_name = quiz['creator_name'] or "Unknown"
+    creator_mention = f"[{creator_name}](tg://user?id={quiz['user_id']})"
+    set_line = ""
+    if quiz.get('set_id'):
+        set_meta = get_set_meta(quiz['set_id'])
+        if set_meta:
+            set_line = f"📁 Set: {set_meta['name']}\n"
+    visibility_line = "🌐 Public — listed in /publicstore\n" if quiz["is_public"] else "🔒 Private\n"
+    text = (
+        f"📚 **{quiz['title']}**\n"
+        + (f"_{FONT_STYLE}_\n" if is_official else "") +
+        (f"💬 {quiz['description']}\n" if quiz.get('description') else "") +
+        f"\n🆔 Quiz ID: `{quiz['id']}`\n"
+        f"👤 Creator: {creator_mention} (`{quiz['user_id']}`)\n"
+        f"⏱ Timer: {timer_text}\n"
+        f"❓ Questions: {len(quiz['questions'])}\n"
+        f"🏷 Type: {type_label}\n"
+        f"{set_line}"
+        f"{visibility_line}"
+        f"👥 Attempts recorded: {attempts}\n\n"
+        f"Any change below (title, description, timer, questions) saves straight to this "
+        f"quiz and applies the moment it's next started — no separate publish step."
+    )
+    keyboard_rows = [
+        [InlineKeyboardButton("▶️ Start Here", callback_data=f"oqstart_{quiz_id}"),
+         InlineKeyboardButton("📤 Share ID", callback_data=f"oqshare_{quiz_id}")],
+        [InlineKeyboardButton("✏️ Edit Title", callback_data=f"stedittitle_{quiz_id}"),
+         InlineKeyboardButton("💬 Edit Description", callback_data=f"steditdesc_{quiz_id}")],
+        [InlineKeyboardButton("⏱ Edit Timer", callback_data=f"stedittimer_{quiz_id}"),
+         InlineKeyboardButton("📁 File in Set", callback_data=f"stsetpick_{quiz_id}")],
+        [InlineKeyboardButton("➕ Add Question", callback_data=f"staddq_{quiz_id}"),
+         InlineKeyboardButton("➖ Remove Question", callback_data=f"stremq_{quiz_id}")],
+        [InlineKeyboardButton("🔒 Make Private" if quiz["is_public"] else "🌐 Make Public",
+                               callback_data=f"stpub_{quiz_id}"),
+         InlineKeyboardButton("🧹 Remove Duplicates", callback_data=f"stdedup_{quiz_id}")],
+        [InlineKeyboardButton("📊 Status (who played, right/wrong)", callback_data=f"ststatus_{quiz_id}_0")],
+        [InlineKeyboardButton("📤 Send to Channel", callback_data=f"stsendch_{quiz_id}")],
+        [InlineKeyboardButton("🗑 Delete Quiz", callback_data=f"stdel_{quiz_id}")],
+        [InlineKeyboardButton("🏷 My Tag", callback_data="stmytag"),
+         InlineKeyboardButton("💬 My Desc Tag", callback_data="stmydesc")],
+        [InlineKeyboardButton("🔤 Option Style", callback_data="stoptstyle")],
+        [InlineKeyboardButton("🔙 Back to My Quizzes", callback_data="menu_store")],
+    ]
+    return text, InlineKeyboardMarkup(keyboard_rows)
+
+
+async def store_manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    quiz_id = int(query.data.replace("stmanage_", ""))
+    text, keyboard = _store_manage_view(quiz_id)
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def store_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    quiz_id = int(query.data.replace("stdel_", ""))
+    quiz = get_quiz_meta(quiz_id)
+    if not quiz:
+        await query.answer("Already deleted.", show_alert=True)
+        return
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Yes, delete it", callback_data=f"stdelok_{quiz_id}"),
+         InlineKeyboardButton("❌ No, keep it", callback_data=f"stmanage_{quiz_id}")],
+    ])
+    await query.answer()
+    await query.edit_message_text(f"🗑 Delete **{quiz['title']}** permanently? This can't be undone.",
+                                   parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def store_delete_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    quiz_id = int(query.data.replace("stdelok_", ""))
+    deleted = delete_quiz(quiz_id, query.from_user.id)
+    await query.answer("Deleted." if deleted else "Couldn't delete — not your quiz.", show_alert=not deleted)
+    text, keyboard = _store_list_view(query.from_user.id, 0)
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def store_toggle_public_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    quiz_id = int(query.data.replace("stpub_", ""))
+    result = toggle_quiz_public(quiz_id, query.from_user.id)
+    if result is None:
+        await query.answer("Couldn't update — not your quiz.", show_alert=True)
+    else:
+        await query.answer("🌐 Now public — listed in /publicstore." if result else "🔒 Back to private.")
+    text, keyboard = _store_manage_view(quiz_id)
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def store_dedup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    quiz_id = int(query.data.replace("stdedup_", ""))
+    removed = dedup_quiz_questions(quiz_id, query.from_user.id)
+    if removed is None:
+        await query.answer("Couldn't update — not your quiz.", show_alert=True)
+    else:
+        await query.answer(f"🧹 Removed {removed} duplicate question(s)." if removed else "No duplicates found.",
+                            show_alert=True)
+    text, keyboard = _store_manage_view(quiz_id)
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+# ==========================================
+# 🌐 PUBLIC QUIZ STORE — opt-in directory any user can browse & play,
+# separate from /mystore (which only ever lists your own quizzes).
+# ==========================================
+PUBLIC_STORE_PAGE_SIZE = 6
+
+
+def _public_store_view(page: int = 0):
+    quizzes = get_public_quizzes()
+    if not quizzes:
+        return (
+            "🌐 No public quizzes yet — open any quiz in /mystore and tap **🌐 Make Public** "
+            "to be the first one listed here.",
+            back_to_tools_keyboard(),
+        )
+    total_pages = max(1, (len(quizzes) + PUBLIC_STORE_PAGE_SIZE - 1) // PUBLIC_STORE_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * PUBLIC_STORE_PAGE_SIZE
+    page_quizzes = quizzes[start:start + PUBLIC_STORE_PAGE_SIZE]
+
+    rows = [[InlineKeyboardButton(f"📁 {q['title'][:28]} — by {q['creator_name'][:15]}",
+                                   callback_data=f"pubview_{q['id']}")]
+            for q in page_quizzes]
+
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ Back", callback_data=f"publist_{page - 1}"))
+        nav.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"publist_{page + 1}"))
+        rows.append(nav)
+
+    rows.append([InlineKeyboardButton("🔙 Back to Tools", callback_data="open_tools")])
+    text = f"🌐 **{stylize('Public Quiz Store')}**\n\n{len(quizzes)} public quizzes — tap one to view and start it."
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def publicstore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text, keyboard = _public_store_view(0)
+    await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def public_store_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    page = int(query.data.replace("publist_", ""))
+    text, keyboard = _public_store_view(page)
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def public_quiz_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    quiz_id = int(query.data.replace("pubview_", ""))
+    quiz = get_quiz_meta(quiz_id)
+    if not quiz or not quiz["is_public"]:
+        await query.edit_message_text("That quiz is no longer public.", reply_markup=back_to_tools_keyboard())
+        return
+    timer_text = f"{quiz['timer_seconds']}s / question" if quiz['timer_seconds'] else "No limit"
+    text = (
+        f"📁 **{quiz['title']}**\n"
+        + (f"💬 {quiz['description']}\n" if quiz.get('description') else "") +
+        f"\n👤 By: {quiz['creator_name'] or 'Unknown'}\n"
+        f"❓ Questions: {len(quiz['questions'])}\n"
+        f"⏱ Timer: {timer_text}"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ Start Here", callback_data=f"oqstart_{quiz_id}")],
+        [InlineKeyboardButton("🔙 Back to Public Store", callback_data="publist_0")],
+    ])
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def store_edit_title_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    quiz_id = int(query.data.replace("stedittitle_", ""))
+    context.user_data['store_edit_quiz_id'] = quiz_id
+    await query.edit_message_text("Send the new title for this quiz.", reply_markup=cancel_keyboard())
+    return STORE_EDIT_TITLE
+
+
+async def store_edit_title_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    quiz_id = context.user_data.pop('store_edit_quiz_id', None)
+    if not quiz_id:
+        await update.message.reply_text("Session expired — open the quiz from /mystore again.")
+        return ConversationHandler.END
+    new_title = (update.message.text or "").strip()[:60]
+    if not new_title:
+        await update.message.reply_text("Please send a valid title, or Cancel.", reply_markup=cancel_keyboard())
+        context.user_data['store_edit_quiz_id'] = quiz_id
+        return STORE_EDIT_TITLE
+    update_quiz_title(quiz_id, new_title)
+    text, keyboard = _store_manage_view(quiz_id)
+    await update.message.reply_text(f"✅ Title updated — live immediately.\n\n{text}", parse_mode="Markdown", reply_markup=keyboard)
+    return ConversationHandler.END
+
+
+async def store_edit_timer_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    quiz_id = int(query.data.replace("stedittimer_", ""))
+    context.user_data['store_edit_quiz_id'] = quiz_id
+    keyboard = cancel_keyboard([
+        [InlineKeyboardButton("10s", callback_data="sttimerpick_10"), InlineKeyboardButton("15s", callback_data="sttimerpick_15"),
+         InlineKeyboardButton("20s", callback_data="sttimerpick_20")],
+        [InlineKeyboardButton("30s", callback_data="sttimerpick_30"), InlineKeyboardButton("60s", callback_data="sttimerpick_60"),
+         InlineKeyboardButton("⏱ No Timer", callback_data="sttimerpick_0")],
+    ])
+    await query.edit_message_text(
+        "Pick a new per-question timer, or type a custom number of seconds (0 = no limit).",
+        reply_markup=keyboard,
+    )
+    return STORE_EDIT_TIMER
+
+
+async def _apply_store_timer(quiz_id: int, seconds: int, edit_target, user_first_name: str = ""):
+    update_quiz_timer(quiz_id, seconds)
+    text, keyboard = _store_manage_view(quiz_id)
+    note = f"✅ Timer updated to {seconds}s — applies immediately, from the next time this quiz is started.\n\n" if seconds else \
+           "✅ Timer removed (no limit) — applies immediately, from the next time this quiz is started.\n\n"
+    await edit_target(note + text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def store_edit_timer_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    quiz_id = context.user_data.pop('store_edit_quiz_id', None)
+    if not quiz_id:
+        await query.edit_message_text("Session expired — open the quiz from /mystore again.")
+        return ConversationHandler.END
+    seconds = int(query.data.replace("sttimerpick_", ""))
+    await _apply_store_timer(quiz_id, seconds, query.edit_message_text)
+    return ConversationHandler.END
+
+
+async def store_edit_timer_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    quiz_id = context.user_data.get('store_edit_quiz_id')
+    if not quiz_id:
+        await update.message.reply_text("Session expired — open the quiz from /mystore again.")
+        return ConversationHandler.END
+    raw = (update.message.text or "").strip()
+    if not raw.isdigit() or int(raw) > 600:
+        await update.message.reply_text("Send a number of seconds (0–600), or tap a button above.")
+        return STORE_EDIT_TIMER
+    context.user_data.pop('store_edit_quiz_id', None)
+    await _apply_store_timer(quiz_id, int(raw), update.message.reply_text)
+    return ConversationHandler.END
+
+
+async def store_edit_desc_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    quiz_id = int(query.data.replace("steditdesc_", ""))
+    context.user_data['store_edit_quiz_id'] = quiz_id
+    await query.edit_message_text(
+        "💬 Send the new description for this quiz (shown to anyone who opens it — what it's about, "
+        "who it's for, etc). Max 200 characters.",
+        reply_markup=cancel_keyboard(),
+    )
+    return STORE_EDIT_DESC
+
+
+async def store_edit_desc_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    quiz_id = context.user_data.pop('store_edit_quiz_id', None)
+    if not quiz_id:
+        await update.message.reply_text("Session expired — open the quiz from /mystore again.")
+        return ConversationHandler.END
+    description = (update.message.text or "").strip()[:200]
+    update_quiz_description(quiz_id, description)
+    text, keyboard = _store_manage_view(quiz_id)
+    await update.message.reply_text(f"✅ Description updated — live immediately.\n\n{text}",
+                                     parse_mode="Markdown", reply_markup=keyboard)
+    return ConversationHandler.END
+
+
+# ==========================================
+# 📁 "File in Set" picker — attaches a quiz to one of the owner's named sets
+# ==========================================
+async def store_set_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    quiz_id = int(query.data.replace("stsetpick_", ""))
+    sets = get_user_sets(query.from_user.id)
+    rows = [[InlineKeyboardButton(f"📁 {s['name']}", callback_data=f"stsetdo_{quiz_id}_{s['id']}")] for s in sets[:20]]
+    rows.append([InlineKeyboardButton("🚫 Remove from any set", callback_data=f"stsetdo_{quiz_id}_none")])
+    rows.append([InlineKeyboardButton("➕ New Set (/newset)", callback_data=f"stmanage_{quiz_id}")])
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data=f"stmanage_{quiz_id}")])
+    text = "📁 Pick a set to file this quiz under:" if sets else \
+        "You don't have any sets yet — create one with `/newset Your Set Name`, then come back here."
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def store_set_assign_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, quiz_id_str, set_id_str = query.data.split('_', 2)
+    quiz_id = int(quiz_id_str)
+    assign_quiz_to_set(quiz_id, None if set_id_str == "none" else int(set_id_str))
+    text, keyboard = _store_manage_view(quiz_id)
+    await query.edit_message_text(("✅ Filed.\n\n" if set_id_str != "none" else "✅ Removed from set.\n\n") + text,
+                                   parse_mode="Markdown", reply_markup=keyboard)
+
+
+# ==========================================
+# 📤 "Send to Channel" — posts the FULL quiz to one of the user's linked channels,
+# with their tag/description/option-style/promo applied exactly like anywhere else.
+# ==========================================
+async def store_send_channel_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    quiz_id = int(query.data.replace("stsendch_", ""))
+    channels = get_user_channels(query.from_user.id)
+    if not channels:
+        await query.edit_message_text(
+            "You haven't linked any channels yet.\n\n"
+            "To link one: add me as **admin** in your channel, then forward any message "
+            "from that channel to me with `/setchannel`.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"stmanage_{quiz_id}")]]),
+        )
+        return
+    rows = [[InlineKeyboardButton(f"📤 {c['channel_title']}", callback_data=f"stsendchdo_{quiz_id}_{c['id']}")] for c in channels[:20]]
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data=f"stmanage_{quiz_id}")])
+    await query.edit_message_text("Pick a channel to post this quiz to:", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def store_send_channel_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Sending...")
+    _, quiz_id_str, row_id_str = query.data.split('_', 2)
+    quiz_id, row_id = int(quiz_id_str), int(row_id_str)
+    quiz = get_quiz_meta(quiz_id)
+    channels = get_user_channels(query.from_user.id)
+    target = next((c for c in channels if c['id'] == row_id), None)
+    if not quiz or not target:
+        await query.edit_message_text("That quiz or channel link no longer exists.")
+        return
+    user = get_user(query.from_user.id)
+    try:
+        sent = await post_quiz_polls(
+            context.bot, target['channel_id'], quiz['questions'],
+            user_tag=user['tag'], explanation_tag=user['description_tag'], option_style=user['option_style'],
+        )
+        await query.edit_message_text(f"✅ Posted {sent} question(s) to **{target['channel_title']}**.",
+                                       parse_mode="Markdown")
+    except Exception as e:
+        logger.warning(f"store_send_channel_do failed: {e}")
+        await query.edit_message_text(
+            f"❌ Couldn't post there — make sure I'm still an admin in that channel. ({e})"
+        )
+
+
+async def store_option_style_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = get_user(query.from_user.id)
+    await query.edit_message_text(
+        "🔤 **Option Style** — how answer options are labelled in every quiz you make:",
+        parse_mode="Markdown", reply_markup=_option_style_keyboard(user['option_style']),
+    )
+
+
+STATUS_PAGE_SIZE = 10
+
+
+async def store_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """📊 Status — the Official Quiz editing-section view the host uses to see exactly
+    who attempted their quiz: user_id (to contact them directly), right/wrong count,
+    accuracy, average answer speed, and score — one row per participant."""
+    query = update.callback_query
+    await query.answer()
+    _, quiz_id_str, page_str = query.data.split('_', 2)
+    quiz_id, page = int(quiz_id_str), int(page_str)
+    quiz = get_quiz_meta(quiz_id)
+    if not quiz:
+        await query.edit_message_text("That quiz no longer exists.", reply_markup=back_to_tools_keyboard())
+        return
+
+    rows = get_quiz_status_rows(quiz_id, limit=1000)
+    total_pages = max(1, (len(rows) + STATUS_PAGE_SIZE - 1) // STATUS_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    page_rows = rows[page * STATUS_PAGE_SIZE: page * STATUS_PAGE_SIZE + STATUS_PAGE_SIZE]
+
+    header = f"📊 **{stylize('Status')}** — {quiz['title']}\n_{FONT_STYLE}_\n\n"
+    if not rows:
+        body = "No attempts recorded yet — the status list fills in as people play this quiz live."
+    else:
+        lines = []
+        for i, r in enumerate(page_rows, start=page * STATUS_PAGE_SIZE + 1):
+            avg_sec = round(r['avg_time_ms'] / 1000, 1)
+            lines.append(
+                f"{i}. {r['user_name']} — `{r['user_id']}`\n"
+                f"      ✅ {r['correct']} ❌ {r['wrong']} · 🎯 {r['accuracy']}% · ⏱ {avg_sec}s avg · {r['score']} pts"
+            )
+        body = "\n".join(lines) + f"\n\n👥 {len(rows)} total attempt(s). User ID is shown for direct contact."
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Back", callback_data=f"ststatus_{quiz_id}_{page - 1}"))
+    if total_pages > 1:
+        nav.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"ststatus_{quiz_id}_{page + 1}"))
+    rows_kb = [nav] if nav else []
+    rows_kb.append([InlineKeyboardButton("🔙 Back to Quiz", callback_data=f"stmanage_{quiz_id}")])
+
+    try:
+        await query.edit_message_text(header + body, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows_kb))
+    except Exception as e:
+        logger.warning(f"store_status_callback edit failed (non-fatal): {e}")
+
+
+async def store_add_question_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    quiz_id = int(query.data.replace("staddq_", ""))
+    context.user_data['store_edit_quiz_id'] = quiz_id
+    await query.edit_message_text(
+        "Send the new question in this format:\n\n"
+        "```\nQ: Question text?\nA) Option 1\nB) Option 2\nC) Option 3\nAnswer: A\n```",
+        parse_mode="Markdown", reply_markup=cancel_keyboard(),
+    )
+    return STORE_ADD_QUESTION
+
+
+async def store_add_question_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    quiz_id = context.user_data.pop('store_edit_quiz_id', None)
+    if not quiz_id:
+        await update.message.reply_text("Session expired — open the quiz from /mystore again.")
+        return ConversationHandler.END
+    new_qs = parse_bulk_questions(update.message.text or "")
+    if not new_qs:
+        await update.message.reply_text("Couldn't parse that — check the format and resend, or Cancel.", reply_markup=cancel_keyboard())
+        context.user_data['store_edit_quiz_id'] = quiz_id
+        return STORE_ADD_QUESTION
+    quiz = get_quiz_meta(quiz_id)
+    if not quiz:
+        await update.message.reply_text("That quiz no longer exists.")
+        return ConversationHandler.END
+    quiz['questions'].extend(new_qs)
+    update_quiz_questions(quiz_id, quiz['questions'])
+    text, keyboard = _store_manage_view(quiz_id)
+    await update.message.reply_text(f"✅ Added {len(new_qs)} question(s).\n\n{text}", parse_mode="Markdown", reply_markup=keyboard)
+    return ConversationHandler.END
+
+
+async def store_remove_question_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    quiz_id = int(query.data.replace("stremq_", ""))
+    quiz = get_quiz_meta(quiz_id)
+    if not quiz or not quiz['questions']:
+        await query.edit_message_text("No questions to remove.", reply_markup=back_to_tools_keyboard())
+        return
+    rows = [
+        [InlineKeyboardButton(f"❌ {i + 1}. {q['question'][:40]}", callback_data=f"stremqok_{quiz_id}_{i}")]
+        for i, q in enumerate(quiz['questions'][:50])
+    ]
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data=f"stmanage_{quiz_id}")])
+    await query.edit_message_text("Tap a question to remove it:", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def store_remove_question_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    _, quiz_id_str, idx_str = query.data.split('_', 2)
+    quiz_id, idx = int(quiz_id_str), int(idx_str)
+    quiz = get_quiz_meta(quiz_id)
+    if not quiz or idx >= len(quiz['questions']):
+        await query.answer("Already removed.", show_alert=True)
+        return
+    quiz['questions'].pop(idx)
+    update_quiz_questions(quiz_id, quiz['questions'])
+    await query.answer("Removed.")
+    text, keyboard = _store_manage_view(quiz_id)
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def store_mytag_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await context.bot.send_message(
+        query.message.chat_id,
+        "🏷 Your tag is added to every quiz you post. Set it with:\n`/settag Your Tag Here`",
+        parse_mode="Markdown",
+    )
+
+
+async def store_mydesc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await context.bot.send_message(
+        query.message.chat_id,
+        "💬 Your description tag is added as the explanation on every quiz you post. Set it with:\n`/setdescription Your Text Here`",
+        parse_mode="Markdown",
+    )
+
+
+async def default_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 Easy", callback_data="setdef_diff_easy"),
+         InlineKeyboardButton("🟡 Medium", callback_data="setdef_diff_medium"),
+         InlineKeyboardButton("🔴 Hard", callback_data="setdef_diff_hard")],
+        [InlineKeyboardButton("Clear default", callback_data="setdef_diff_")],
+        [InlineKeyboardButton("🔙 Back to Tools", callback_data="open_tools")],
+    ])
+    await update.message.reply_text("Pick your default difficulty (skips the prompt next time):", reply_markup=keyboard)
+
+
+async def receive_default_diff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    diff = query.data.replace('setdef_diff_', '')
+    set_user_field(update.effective_user.id, 'default_difficulty', diff)
+    await query.edit_message_text(f"✅ Default difficulty: {diff or '(cleared)'}", reply_markup=back_to_tools_keyboard())
+
+
+# ==========================================
+# 🔑 BRING-YOUR-OWN-API-KEY CONVERSATION
+# Every user can add AS MANY keys as they want — any mix of Groq / Gemini /
+# OpenAI / Anthropic / open-source (OpenAI-compatible) endpoints — with
+# /addapi. All saved in SQLite (user_api_keys), so they survive bot restarts.
+# Generation tries them in the order added; if one fails (bad key, model can't
+# read an image, provider down, etc.) it automatically moves to the next —
+# and the owner's shared key is always the guaranteed final fallback.
+# ==========================================
+def api_provider_keyboard():
+    rows, row = [], []
+    for key, preset in PROVIDER_PRESETS.items():
+        row.append(InlineKeyboardButton(preset["label"], callback_data=f"apiprov_{key}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("🗑 Remove ALL my keys", callback_data="apiprov_removeall")])
+    rows.append([InlineKeyboardButton("🔙 Cancel", callback_data="apiprov_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def addapi_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    keys = get_user_api_keys(update.effective_user.id)
+    if keys:
+        lines = []
+        for k in keys:
+            preset = PROVIDER_PRESETS.get(k['provider'], {})
+            lines.append(f"• #{k['id']} {preset.get('label', k['provider'])} — `{mask_key(k['api_key'])}`")
+        status = "Your saved keys (tried in this order, then the owner's key as final fallback):\n" + "\n".join(lines)
+    else:
+        status = "No personal keys yet — you're running on the bot's shared default key (if the owner has set one)."
+    await msg.reply_text(
+        f"🔑 **{stylize('Add An API Key')}**\n_{FONT_STYLE}_\n\n"
+        f"{status}\n\n"
+        "You can add **as many keys/providers as you like** — 1, 10, whatever. If one fails "
+        "or can't handle something (e.g. a text-only model given a photo), the bot automatically "
+        "tries the next one. The owner's key always works as the last resort either way.\n\n"
+        "Pick a provider to add:",
+        parse_mode="Markdown",
+        reply_markup=api_provider_keyboard(),
+    )
+    return ASK_API_PROVIDER
+
+
+async def addapi_button_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    return await addapi_entry(update, context)
+
+
+async def receive_api_provider(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.replace("apiprov_", "")
+
+    if choice == "cancel":
+        await query.edit_message_text(
+            "❌ Cancelled — nothing was lost. Your saved quizzes, API keys, groups and quota are all safe."
+        )
+        return ConversationHandler.END
+
+    if choice == "removeall":
+        delete_all_user_api_keys(update.effective_user.id)
+        await query.edit_message_text("🗑 Removed all your saved keys — back to the bot's shared default key.")
+        return ConversationHandler.END
+
+    context.user_data['api_provider'] = choice
+    preset = PROVIDER_PRESETS[choice]
+
+    if choice == "custom":
+        await query.edit_message_text(
+            "⚙️ Send the base URL of your OpenAI-compatible endpoint\n"
+            "(e.g. `https://api.together.xyz/v1`, `https://openrouter.ai/api/v1`, "
+            "or a local server like `http://localhost:11434/v1` for Ollama).\n\n"
+            "Or /cancel anytime.",
+            parse_mode="Markdown",
+        )
+        return ASK_API_CUSTOM_BASE
+
+    await query.edit_message_text(
+        f"🔐 Send your **{preset['label']}** API key now.\n\n"
+        "_Tip: delete your message right after — I'll confirm once it's saved, "
+        "so it doesn't sit around in the chat history._\n\nOr /cancel anytime.",
+        parse_mode="Markdown",
+    )
+    return ASK_API_KEY
+
+
+async def receive_api_custom_base(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    base = update.message.text.strip()
+    if not base.startswith("http"):
+        await update.message.reply_text("That doesn't look like a URL — send the full base URL (starting with http/https).")
+        return ASK_API_CUSTOM_BASE
+    context.user_data['api_base'] = base.rstrip('/')
+    await update.message.reply_text(
+        "Now send the model name to use (e.g. `llama3.1`, `mixtral-8x7b-32768`, `qwen2.5:7b`).",
+        parse_mode="Markdown",
+    )
+    return ASK_API_CUSTOM_MODEL
+
+
+async def receive_api_custom_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['api_model'] = update.message.text.strip()[:100]
+    await update.message.reply_text(
+        "Send the API key for this endpoint, or type `none` if it doesn't need one "
+        "(e.g. a local server on your own machine).",
+        parse_mode="Markdown",
+    )
+    return ASK_API_KEY
+
+
+async def receive_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    key_text = update.message.text.strip()
+    provider = context.user_data.get('api_provider')
+    preset = PROVIDER_PRESETS.get(provider, {})
+    api_key = "" if key_text.lower() == "none" else key_text
+    api_base = context.user_data.get('api_base') or preset.get('api_base')
+    model = context.user_data.get('api_model') or preset.get('model')
+
+    if provider != "custom" and not api_key:
+        await update.message.reply_text("That key looks empty — please send a valid key, or /cancel.")
+        return ASK_API_KEY
+
+    add_user_api_key(update.effective_user.id, provider, api_key, api_base, model)
+
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    await update.effective_chat.send_message(
+        f"✅ Added! **{preset.get('label', provider)}** (key: `{mask_key(api_key)}`) is now in your "
+        "fallback chain — the bot tries your keys in the order you added them, then the owner's "
+        "key if all of yours fail.\n\n"
+        "Add more anytime with /addapi, see the full list with /myapi.",
+        parse_mode="Markdown",
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def myapi_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keys = get_user_api_keys(update.effective_user.id)
+    if not keys:
+        await update.message.reply_text("No personal keys saved — you're using the bot's shared default key. Add one with /addapi.")
+        return
+    lines = ["🔑 Your saved keys (tried in this order, then the bot's shared key as final fallback):"]
+    for k in keys:
+        preset = PROVIDER_PRESETS.get(k['provider'], {})
+        lines.append(f"#{k['id']} — {preset.get('label', k['provider'])} — `{mask_key(k['api_key'])}` — model: {k['model'] or '(default)'}")
+    lines.append("\nRemove one: /removeapi <id>  •  Remove all: /removeapi all")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=back_to_tools_keyboard())
+
+
+async def removeapi_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text("Usage: /removeapi <id> — see IDs with /myapi. Or /removeapi all to remove everything.")
+        return
+    arg = context.args[0].strip().lower()
+    if arg == "all":
+        delete_all_user_api_keys(user_id)
+        await update.message.reply_text("🗑 Removed all your saved keys — back to the bot's shared default key.")
+        return
+    try:
+        key_id = int(arg)
+    except ValueError:
+        await update.message.reply_text("Usage: /removeapi <id> or /removeapi all")
+        return
+    delete_user_api_key_by_id(user_id, key_id)
+    await update.message.reply_text(f"🗑 Removed key #{key_id} (if it existed and was yours).")
+
+
+# ==========================================
+# ✏️ EDIT CONVERSATION
+# ==========================================
+async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    quizzes = get_user_quizzes(update.effective_user.id)
+    if not quizzes:
+        await update.message.reply_text("You have no saved quizzes to edit.")
+        return ConversationHandler.END
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(q['title'][:30] or f"Quiz {q['id']}", callback_data=f"editpick_{q['id']}")]
+        for q in quizzes[:10]
+    ])
+    await update.message.reply_text("Pick a quiz to edit:", reply_markup=keyboard)
+    return ASK_EDIT_CHOICE
+
+
+async def edit_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    quiz_id = int(query.data.replace('editpick_', ''))
+    quiz = get_quiz_by_id(quiz_id)
+    if not quiz or quiz['user_id'] != update.effective_user.id:
+        await query.edit_message_text("Quiz not found.")
+        return ConversationHandler.END
+    context.user_data['editing_quiz_id'] = quiz_id
+    lines = [f"{i + 1}. {q['question']}" for i, q in enumerate(quiz['questions'])]
+    await query.edit_message_text("Reply with:\n<number> <new question text>\n\n" + "\n".join(lines))
+    return ASK_EDIT_TEXT
+
+
+async def edit_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text or ''
+    parts = text.split(' ', 1)
+    if len(parts) < 2 or not parts[0].isdigit():
+        await update.message.reply_text("Format: <number> <new question text>")
+        return ASK_EDIT_TEXT
+    idx = int(parts[0]) - 1
+    new_text = parts[1]
+    quiz_id = context.user_data.get('editing_quiz_id')
+    quiz = get_quiz_by_id(quiz_id) if quiz_id else None
+    if not quiz or not (0 <= idx < len(quiz['questions'])):
+        await update.message.reply_text("Invalid question number.")
+        return ConversationHandler.END
+    quiz['questions'][idx]['question'] = new_text[:290]
+    update_quiz(quiz_id, quiz['questions'])
+    await update.message.reply_text("✅ Updated. Run /mystore anytime to see your quizzes.")
+    context.user_data.pop('editing_quiz_id', None)
+    return ConversationHandler.END
+
+
+# ==========================================
+# 🛡️ GROUP MANAGEMENT
+# ==========================================
+async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_chat_admin(update, context):
+        await update.message.reply_text("⛔ Admins only.")
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Reply to a user's message with /mute.")
+        return
+    target = update.message.reply_to_message.from_user
+    await context.bot.restrict_chat_member(
+        update.effective_chat.id, target.id,
+        permissions=ChatPermissions(can_send_messages=False)
+    )
+    await update.message.reply_text(f"🔇 Muted {target.first_name}.")
+
+
+async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_chat_admin(update, context):
+        await update.message.reply_text("⛔ Admins only.")
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Reply to a user's message with /unmute.")
+        return
+    target = update.message.reply_to_message.from_user
+    await context.bot.restrict_chat_member(
+        update.effective_chat.id, target.id,
+        permissions=ChatPermissions(
+            can_send_messages=True, can_send_audios=True, can_send_documents=True,
+            can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
+            can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
+            can_add_web_page_previews=True,
+        )
+    )
+    await update.message.reply_text(f"🔊 Unmuted {target.first_name}.")
+
+
+async def promote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_chat_admin(update, context):
+        await update.message.reply_text("⛔ Admins only.")
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Reply to a user's message with /promote.")
+        return
+    target = update.message.reply_to_message.from_user
+    await context.bot.promote_chat_member(
+        update.effective_chat.id, target.id,
+        can_delete_messages=True, can_restrict_members=True,
+        can_pin_messages=True, can_invite_users=True,
+    )
+    await update.message.reply_text(f"⬆️ Promoted {target.first_name}.")
+
+
+async def demote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_chat_admin(update, context):
+        await update.message.reply_text("⛔ Admins only.")
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Reply to a user's message with /demote.")
+        return
+    target = update.message.reply_to_message.from_user
+    await context.bot.promote_chat_member(
+        update.effective_chat.id, target.id,
+        can_delete_messages=False, can_restrict_members=False,
+        can_pin_messages=False, can_invite_users=False,
+    )
+    await update.message.reply_text(f"⬇️ Demoted {target.first_name}.")
+
+
+async def purge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_chat_admin(update, context):
+        await update.message.reply_text("⛔ Admins only.")
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Reply to the first message you want deleted, with /purge.")
+        return
+    start_id = update.message.reply_to_message.message_id
+    end_id = update.message.message_id
+    deleted = 0
+    for mid in range(start_id, end_id + 1):
+        try:
+            await context.bot.delete_message(update.effective_chat.id, mid)
+            deleted += 1
+        except Exception:
+            pass
+    await update.effective_chat.send_message(f"🧹 Purged {deleted} messages.")
+
+
+async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    target = update.message.reply_to_message.from_user if update.message.reply_to_message else update.effective_user
+    text = (
+        f"👤 Name: {target.first_name}\n"
+        f"🆔 ID: {target.id}\n"
+        f"🔗 Username: @{target.username if target.username else 'N/A'}"
+    )
+    await update.message.reply_text(text)
+
+
+async def filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_chat_admin(update, context):
+        await update.message.reply_text("⛔ Admins only.")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /filter keyword reply text")
+        return
+    keyword = context.args[0].lower()
+    reply = " ".join(context.args[1:])
+    add_group_filter(update.effective_chat.id, keyword, reply)
+    await update.message.reply_text(f"✅ Filter added for '{keyword}'.")
+
+
+async def removefilter_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_chat_admin(update, context):
+        await update.message.reply_text("⛔ Admins only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /removefilter keyword")
+        return
+    keyword = context.args[0].lower()
+    remove_group_filter(update.effective_chat.id, keyword)
+    await update.message.reply_text(f"🗑 Filter '{keyword}' removed.")
+
+
+async def filters_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = list_group_filters(update.effective_chat.id)
+    if not rows:
+        await update.message.reply_text("No filters set in this chat.")
+        return
+    await update.message.reply_text("Filters:\n" + "\n".join(f"• {r[0]}" for r in rows))
+
+
+async def check_filters(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+    text = update.message.text.lower()
+    for keyword, reply in list_group_filters(update.effective_chat.id):
+        if keyword in text:
+            await update.message.reply_text(reply)
+            break
+
+
+# ==========================================
+# 👋 GROUP WELCOME / GOODBYE
+# ==========================================
+GROUP_ADD_BONUS_QUESTIONS = 100
+
+
+async def handle_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    msg = update.message
+    if not msg or not msg.new_chat_members:
+        return
+    try:
+        me = await context.bot.get_me()
+    except Exception:
+        me = None
+    bot_was_added = any(m.is_bot and me and m.id == me.id for m in msg.new_chat_members)
+    if bot_was_added and not group_is_tracked(chat.id) and msg.from_user:
+        increment_question_limit(msg.from_user.id, GROUP_ADD_BONUS_QUESTIONS)
+        try:
+            await context.bot.send_message(
+                msg.from_user.id,
+                f"🎉 **Group Added Successfully!**\n\nThanks for adding me to **{chat.title or 'your group'}**.\n"
+                f"🎁 **+{GROUP_ADD_BONUS_QUESTIONS} bonus questions** added to your quota!",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass  # they may not have started a DM with the bot yet — bonus is still credited
+    track_group(chat.id, chat.title or "")
+    settings = get_group_settings(chat.id)
+    if not settings["enabled"]:
+        return
+    try:
+        me = await context.bot.get_me()
+    except Exception:
+        me = None
+    for member in msg.new_chat_members:
+        if member.is_bot and me and member.id == me.id:
+            continue  # the bot itself being added isn't a "new member" to welcome
+        text = render_welcome_template(settings["welcome_msg"], member.first_name or "there", member.id, chat.title or "")
+        try:
+            await msg.reply_text(text, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning(f"Welcome message send failed (non-fatal, group unaffected): {e}")
+
+
+async def handle_left_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    msg = update.message
+    member = msg.left_chat_member if msg else None
+    if not member or member.is_bot:
+        return
+    settings = get_group_settings(chat.id)
+    if not settings["enabled"]:
+        return
+    safe_name = member.first_name or "Someone"
+    text = (settings["goodbye_msg"] or DEFAULT_GOODBYE_MSG).replace("{name}", safe_name).replace(
+        "{group}", chat.title or "the group")[:1000]
+    try:
+        await msg.reply_text(text)
+    except Exception as e:
+        logger.warning(f"Goodbye message send failed (non-fatal, group unaffected): {e}")
+
+
+async def welcome_toggle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("This only works inside a group.")
+        return
+    if not await is_chat_admin(update, context):
+        await update.message.reply_text("⛔ Admins only.")
+        return
+    if not context.args or context.args[0].lower() not in ("on", "off"):
+        await update.message.reply_text("Usage: `/welcome on` or `/welcome off`", parse_mode="Markdown")
+        return
+    enabled = context.args[0].lower() == "on"
+    upsert_group_settings(update.effective_chat.id, welcome_enabled=1 if enabled else 0)
+    await update.message.reply_text(f"✅ Welcome/goodbye messages are now **{'ON' if enabled else 'OFF'}** in this group.",
+                                     parse_mode="Markdown")
+
+
+async def setwelcome_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("This only works inside a group.")
+        return
+    if not await is_chat_admin(update, context):
+        await update.message.reply_text("⛔ Admins only.")
+        return
+    parts = update.message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await update.message.reply_text(
+            "Usage: `/setwelcome Your message here`\nPlaceholders: `{mention}`, `{name}`, `{group}`",
+            parse_mode="Markdown",
+        )
+        return
+    upsert_group_settings(update.effective_chat.id, welcome_msg=parts[1].strip()[:1000])
+    await update.message.reply_text("✅ Welcome message updated — applies from the next member who joins.")
+
+
+async def setgoodbye_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("This only works inside a group.")
+        return
+    if not await is_chat_admin(update, context):
+        await update.message.reply_text("⛔ Admins only.")
+        return
+    parts = update.message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await update.message.reply_text(
+            "Usage: `/setgoodbye Your message here`\nPlaceholders: `{name}`, `{group}`",
+            parse_mode="Markdown",
+        )
+        return
+    upsert_group_settings(update.effective_chat.id, goodbye_msg=parts[1].strip()[:1000])
+    await update.message.reply_text("✅ Goodbye message updated.")
+
+
+# ==========================================
+# 📣 OWNER QUIZ-BLAST — one question, broadcast as a poll to every tracked group
+# ==========================================
+async def quizblast_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("⛔ Owner only.")
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "📣 **Quiz Blast** — send ONE question in this format and I'll post it as a live "
+        "quiz poll to every group I'm tracking:\n\n"
+        "```\nQuestion text?\nOption A\nOption B ✅\nOption C\nOption D\n```",
+        parse_mode="Markdown", reply_markup=cancel_keyboard(),
+    )
+    return ASK_QUIZBLAST_TEXT
+
+
+async def quizblast_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    questions = parse_bulk_questions(update.message.text or "")
+    if not questions:
+        await update.message.reply_text("Couldn't parse that — check the format above and resend, or Cancel.",
+                                          reply_markup=cancel_keyboard())
+        return ASK_QUIZBLAST_TEXT
+    q = questions[0]
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT group_id FROM groups")
+    group_ids = [r[0] for r in cur.fetchall()]
+    conn.close()
+
+    ok, fail = 0, 0
+    for gid in group_ids:
+        try:
+            await context.bot.send_poll(
+                chat_id=gid, question=q['question'][:300], options=[o[:100] for o in q['options']],
+                type=Poll.QUIZ, correct_option_id=q['correct_index'], is_anonymous=False,
+            )
+            ok += 1
+        except Exception as e:
+            fail += 1
+            logger.warning(f"Quiz blast failed for group {gid} (skipped, others unaffected): {e}")
+        await asyncio.sleep(0.05)
+    await update.message.reply_text(f"✅ Blasted to {ok} group(s), failed for {fail}.")
+    return ConversationHandler.END
+
+
+# ==========================================
+# 📥 /add_bulk — bulk-import a whole quiz from pasted text OR an uploaded .txt file
+# Same "Question / options / ✅-marked answer, blank line between questions" format as
+# everywhere else in the bot — /add_bulk just also accepts it as a file attachment.
+# ==========================================
+async def addbulk_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📥 **Add Bulk Quiz** — first, what should this quiz be titled?",
+        parse_mode="Markdown", reply_markup=cancel_keyboard(),
+    )
+    return ADD_BULK_TITLE
+
+
+async def addbulk_receive_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    title = (update.message.text or "").strip()[:60]
+    if not title:
+        await update.message.reply_text("Send a title (max 60 characters), or Cancel.", reply_markup=cancel_keyboard())
+        return ADD_BULK_TITLE
+    context.user_data['addbulk_title'] = title
+    await update.message.reply_text(
+        "Now send the questions — **either** paste them as a message, **or** upload a `.txt` file "
+        "in this format (blank line between questions, ✅ on the correct option):\n\n"
+        "```\nQuestion text?\nOption A\nOption B ✅\nOption C\nOption D\n\nNext question?\nOption A ✅\nOption B\n```",
+        parse_mode="Markdown", reply_markup=cancel_keyboard(),
+    )
+    return ADD_BULK_CONTENT
+
+
+async def addbulk_receive_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    title = context.user_data.get('addbulk_title', 'Quiz')
+
+    if msg.document:
+        try:
+            tg_file = await msg.document.get_file()
+            raw = await tg_file.download_as_bytearray()
+            text = bytes(raw).decode("utf-8", errors="ignore")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Couldn't read that file ({e}) — try pasting the text instead, or Cancel.",
+                                              reply_markup=cancel_keyboard())
+            return ADD_BULK_CONTENT
+    else:
+        text = msg.text or ""
+
+    questions = parse_bulk_questions(text)
+    if not questions:
+        await update.message.reply_text(
+            "Couldn't find any valid questions in that — check the format shown above and resend "
+            "(text or .txt file), or Cancel.",
+            reply_markup=cancel_keyboard(),
+        )
+        return ADD_BULK_CONTENT
+
+    user = update.effective_user
+    quiz_id = save_quiz(user.id, title, questions, quiz_type='official', creator_name=user.first_name or 'Unknown')
+    context.user_data.pop('addbulk_title', None)
+    text_out, keyboard = _store_manage_view(quiz_id)
+    await update.message.reply_text(f"✅ Imported {len(questions)} question(s).\n\n{text_out}",
+                                     parse_mode="Markdown", reply_markup=keyboard)
+    return ConversationHandler.END
+
+
+# ==========================================
+# ⏰ SCHEDULE
+# ==========================================
+async def schedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /schedule <minutes> — resend your last quiz after N minutes.")
+        return
+    minutes = int(context.args[0])
+    user_id = update.effective_user.id
+    if not get_last_source(user_id):
+        await update.message.reply_text("Nothing to schedule yet — create a quiz first.")
+        return
+    if not context.job_queue:
+        await update.message.reply_text(
+            "Scheduling isn't available — install the job-queue extra "
+            "(pip install \"python-telegram-bot[job-queue]\")."
+        )
+        return
+    chat_id = update.effective_chat.id
+    run_at = datetime.utcnow() + timedelta(minutes=minutes)
+
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO scheduled_quizzes (user_id, chat_id, run_at) VALUES (?, ?, ?)",
+        (user_id, chat_id, run_at.isoformat()),
+    )
+    conn.commit()
+    schedule_id = last_insert_id(cur, conn, "scheduled_quizzes")
+    conn.close()
+
+    context.job_queue.run_once(
+        run_scheduled_quiz, minutes * 60,
+        data={"user_id": user_id, "chat_id": chat_id, "schedule_id": schedule_id},
+        name=f"sched_{schedule_id}",
+    )
+    await update.message.reply_text(
+        f"⏰ Quiz scheduled in {minutes} minute(s) (#{schedule_id}). "
+        "Lost if the bot restarts before then — check /myschedules anytime, or cancel it there."
+    )
+
+
+async def run_scheduled_quiz(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data
+    try:
+        await do_regenerate(context.bot, data["chat_id"], data["user_id"])
+    finally:
+        conn = db_connect()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM scheduled_quizzes WHERE id = ?", (data["schedule_id"],))
+        conn.commit()
+        conn.close()
+
+
+async def myschedules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    now_iso = datetime.utcnow().isoformat()
+
+    conn = db_connect()
+    cur = conn.cursor()
+    # Sweep rows whose time has already passed without firing — most likely a bot
+    # restart dropped the in-memory job before it ran, so nothing will show for it.
+    cur.execute("DELETE FROM scheduled_quizzes WHERE run_at < ?", (now_iso,))
+    conn.commit()
+    cur.execute(
+        "SELECT id, chat_id, run_at FROM scheduled_quizzes WHERE user_id = ? ORDER BY run_at",
+        (user_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await update.effective_message.reply_text(
+            "You have no pending scheduled quizzes.\nUse /schedule <minutes> to create one."
+        )
+        return
+
+    now = datetime.utcnow()
+    lines = [f"📅 **{stylize('Your Scheduled Quizzes')}**\n_{FONT_STYLE}_\n"]
+    keyboard = []
+    for sid, chat_id, run_at in rows:
+        try:
+            mins_left = max(0, int((datetime.fromisoformat(run_at) - now).total_seconds() // 60))
+            when = f"in ~{mins_left} min"
+        except ValueError:
+            when = "time unknown"
+        lines.append(f"• #{sid} — {when} (chat `{chat_id}`)")
+        keyboard.append([InlineKeyboardButton(f"❌ Cancel #{sid}", callback_data=f"schedcancel_{sid}")])
+
+    await update.effective_message.reply_text(
+        "\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def schedule_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    schedule_id = int(query.data.replace("schedcancel_", ""))
+    user_id = update.effective_user.id
+
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id FROM scheduled_quizzes WHERE id = ?", (schedule_id,))
+    row = cur.fetchone()
+    if not row or row[0] != user_id:
+        conn.close()
+        await query.edit_message_text("❌ Not found — it may have already run or been cancelled.")
+        return
+    cur.execute("DELETE FROM scheduled_quizzes WHERE id = ?", (schedule_id,))
+    conn.commit()
+    conn.close()
+
+    if context.job_queue:
+        for job in context.job_queue.get_jobs_by_name(f"sched_{schedule_id}"):
+            job.schedule_removal()
+
+    await query.edit_message_text(f"🗑 Cancelled scheduled quiz #{schedule_id}.")
+
+
+# ==========================================
+# 🎛️ CALLBACK QUERY ROUTER (menu navigation + verification)
+# ==========================================
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    user_id = query.from_user.id
+    user_name = query.from_user.first_name
+
+    # Lightweight anti-flood: a user double/triple-tapping the same button (or mashing
+    # buttons) can otherwise trigger duplicate work and stack up Telegram rate-limit
+    # errors. This blocks nothing a real single tap would ever hit.
+    now = time.monotonic()
+    last_tap = context.application.bot_data.setdefault('_last_callback_at', {})
+    if now - last_tap.get(user_id, 0) < 0.5:
+        await query.answer()
+        return
+    last_tap[user_id] = now
+
+    if data == "check_verification":
+        await query.answer()
+        is_verified = await check_user_membership(context.bot, user_id)
+        if is_verified:
+            set_verified(user_id, 1)
+            user_data = get_user(user_id)
+            await query.edit_message_text(
+                text=build_welcome_text(user_name, user_data, verified_banner=True),
+                parse_mode="Markdown", reply_markup=main_welcome_keyboard()
+            )
+        else:
+            await query.answer("❌ You haven't joined the required Channel or Group yet!", show_alert=True)
+        return
+
+    if user_id != OWNER_ID:
+        user_data = get_user(user_id)
+        if not user_data['is_verified']:
+            if await check_user_membership(context.bot, user_id):
+                set_verified(user_id, 1)
+            else:
+                await query.answer(
+                    "🔐 Please join our update channel & group first, then tap ✅ I Am Verified.",
+                    show_alert=True,
+                )
+                return
+
+    await query.answer()
+
+    if data == "menu_main":
+        user_data = get_user(user_id)
+        await query.edit_message_text(
+            text=build_welcome_text(user_name, user_data),
+            parse_mode="Markdown", reply_markup=main_welcome_keyboard()
+        )
+
+    elif data == "open_tools":
+        await query.edit_message_text(
+            text=f"🛠️ **{stylize('Tools & Features Menu')}**\n_{FONT_STYLE}_\n\nSelect any tool below to proceed:",
+            parse_mode="Markdown",
+            reply_markup=tools_menu_keyboard()
+        )
+
+    elif data == "open_help":
+        help_text = (
+            f"📖 **{stylize('Help & Commands List')}**\n"
+            f"_{FONT_STYLE}_\n\n"
+            f"📌 Use the **🛠️ Tools** button to access creation tools, or run commands like `/topic`, `/pdf`, `/mystore` directly."
+        )
+        await query.edit_message_text(
+            text=help_text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="menu_main")]])
+        )
+
+    elif data == "create_poll_clean":
+        await query.edit_message_text(
+            text=(
+                f"🔄 **{stylize('Poll to Quiz')}**\n_{FONT_STYLE}_\n\n"
+                "Just forward any MCQ poll into this chat — no command needed.\n"
+                "If it's closed, I'll auto-detect the right answer; otherwise I'll ask you to pick it.\n"
+                "You can forward several polls at once."
+            ),
+            parse_mode="Markdown", reply_markup=back_to_tools_keyboard()
+        )
+
+    elif data == "act_regenerate":
+        await do_regenerate(context.bot, query.message.chat_id, user_id)
+
+    elif data == "menu_customize":
+        await query.edit_message_text(
+            text=(
+                f"⚙️ **{stylize('Customize')}**\n_{FONT_STYLE}_\n\n"
+                "• `/settag YourTag` — shown under every question\n"
+                "• `/setdescription YourTag` — shown in the explanation (💡)\n"
+                "• `/default` — set a default difficulty"
+            ),
+            parse_mode="Markdown", reply_markup=back_to_tools_keyboard()
+        )
+
+    elif data == "menu_store":
+        text, keyboard = _store_list_view(user_id, 0)
+        await query.edit_message_text(text=text, parse_mode="Markdown", reply_markup=keyboard)
+
+    elif data == "menu_publicstore":
+        text, keyboard = _public_store_view(0)
+        await query.edit_message_text(text=text, parse_mode="Markdown", reply_markup=keyboard)
+
+    elif data == "menu_group":
+        await query.edit_message_text(
+            text=(
+                f"🛡️ **{stylize('Group Management Panel')}**\n_{FONT_STYLE}_\n\n"
+                "Use these directly in your group (admins only):\n"
+                "`/mute`, `/unmute`, `/promote`, `/demote`, `/purge`, `/info`, `/filter`, `/removefilter`, `/filters`"
+            ),
+            parse_mode="Markdown", reply_markup=back_to_tools_keyboard()
+        )
+
+
+# 🚨 GLOBAL ERROR HANDLER
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Catches anything an individual handler didn't catch itself, so ONE bad update
+    never brings the whole bot down. Classifies the common "bot goes offline" causes
+    (Conflict / network hiccups) so the log actually tells you what happened instead of
+    a bare traceback, and — for Conflict specifically — DMs the owner, since that one
+    means a SECOND copy of the bot is polling with the same token (e.g. an old Render
+    deploy that never fully stopped) and code alone can't fix that; the running
+    instance needs to be stopped.
+    """
+    err = context.error
+    err_name = err.__class__.__name__
+
+    if err_name == "Conflict":
+        logger.error(
+            "⚠️ Telegram 'Conflict' — another instance of this bot is ALSO polling with "
+            "the same BOT_TOKEN right now (old deploy still running, or the bot running "
+            "in two places at once). Stop the other instance — the bot will keep retrying "
+            "in the meantime but updates will be split unpredictably between the two."
+        )
+        try:
+            if OWNER_ID:
+                await context.bot.send_message(
+                    OWNER_ID,
+                    "⚠️ Bot Conflict error: a SECOND instance of this bot is polling with the "
+                    "same token (old deploy / duplicate process). Stop the other one — this "
+                    "is very likely why the bot has been going offline/misbehaving.",
+                )
+        except Exception:
+            pass
+        return
+
+    if err_name in ("NetworkError", "TimedOut", "RetryAfter"):
+        logger.warning(f"Transient network issue ({err_name}): {err} — python-telegram-bot will retry automatically.")
+        return
+
+    if err_name == "Forbidden":
+        # A user blocking the bot, or the bot getting removed/blocked from a group, is
+        # normal and expected — it must NEVER crash anything or need owner attention.
+        # Just log it quietly and move on; that one user/group is simply skipped next time.
+        logger.info(f"Forbidden (bot blocked/removed by a user or group) — ignored safely: {err}")
+        return
+
+    if err_name == "BadRequest" and "not modified" in str(err).lower():
+        # Editing a message with the exact same text/keyboard it already has — harmless,
+        # not worth logging as an error.
+        logger.debug(f"Harmless no-op edit ignored: {err}")
+        return
+
+    logger.error("Exception while handling an update:", exc_info=err)
+
+
+# ==========================================
+# 🌐 KEEP-ALIVE WEB SERVER (Render/Railway/Replit free "Web Service" tier)
+# ==========================================
+# Render's free plan only offers *Web Services* for free (background workers are
+# paid) — but a Web Service must bind to $PORT within a startup timeout, or Render
+# kills it as "Timed Out". This bot only does Telegram long-polling and never opens
+# a port, so that's exactly what was happening. This tiny HTTP server runs in a
+# background thread just so Render sees a live port; it also gives you a URL to
+# point a free uptime pinger (UptimeRobot / cron-job.org, every 5–10 min) at, so the
+# free instance doesn't spin down from inactivity after 15 min.
+class _PingHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Quiz bot is running.")
+
+    def log_message(self, format, *args):
+        pass  # keep Render's log output clean — Telegram updates are logged separately
+
+
+def start_keepalive_server():
+    port = int(os.getenv("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), _PingHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print(f"🌐 Keep-alive HTTP server listening on port {port} (for Render health check + UptimeRobot)")
+
+
+
+# ==========================================
+# 🔗 MASTER COMPATIBILITY / SECOND-BOT FEATURES
+# ==========================================
+# These handlers are merged into the PTB engine instead of running a second
+# TeleBot process. That avoids Telegram getUpdates conflicts and keeps one
+# source of truth for the database/session state.
+
+async def newquiz_compat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Official Quiz Bot-style builder alias. /newquiz uses the same stable
+    title → timer → forward/bulk → ready flow as /officialquiz."""
+    return await officialquiz_entry(update, context)
+
+async def my_quizzes_compat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await mystore_command(update, context)
+
+async def settings_compat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Keep the second bot's /settings name while using the richer first-bot panel.
+    await update.effective_message.reply_text(
+        f"⚙️ **{stylize('Personal Settings')}**\n_{FONT_STYLE}_\n\n"
+        "Use the buttons below or these commands:\n"
+        "• /settag — personal tag\n"
+        "• /setdescription — explanation/description tag\n"
+        "• /optionstyle — option formatting\n"
+        "• /default — default difficulty",
+        parse_mode="Markdown", reply_markup=back_to_tools_keyboard()
+    )
+
+async def todaylb_compat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await leaderboard_command(update, context)
+
+async def sync_compat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.effective_message.reply_text("⛔ Owner only.")
+        return
+    conn = db_connect(); cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM groups")
+    count = cur.fetchone()[0]
+    conn.close()
+    await update.effective_message.reply_text(f"🔄 Database synced. {count} tracked group(s) ready.")
+
+async def stats_compat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = db_connect(); cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM users"); users = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM quizzes"); quizzes = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM groups"); groups = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM quiz_results"); results = cur.fetchone()[0]
+    conn.close()
+    await update.effective_message.reply_text(
+        "📊 **BOT STATISTICS**\n\n"
+        f"👤 Users: {users}\n📚 Saved quizzes: {quizzes}\n"
+        f"👥 Tracked groups: {groups}\n🏆 Result records: {results}", parse_mode="Markdown"
+    )
+
+async def restart_compat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.effective_message.reply_text("⛔ Owner only.")
+        return
+    await update.effective_message.reply_text("♻️ Restart requested. The master run_forever loop will restart the process if it exits.")
+    # Do not call os._exit from a Telegram handler; that can kill the free web
+    # service before Render receives a clean signal. The wrapper handles crashes.
+
+async def backup_compat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await backupnow_command(update, context)
+
+async def del_quiz_compat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.effective_message.reply_text("⛔ Owner only."); return
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /del_quiz <quiz_id>"); return
+    try: qid=int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("❌ Invalid quiz ID."); return
+    ok=delete_quiz(qid, OWNER_ID)
+    await update.effective_message.reply_text("🗑 Quiz deleted." if ok else "❌ Quiz not found or not deletable.")
+
+async def del_set_compat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.effective_message.reply_text("⛔ Owner only."); return
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /del_set <set_id>"); return
+    try: sid=int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("❌ Invalid set ID."); return
+    ok=delete_quiz_set(sid, OWNER_ID)
+    await update.effective_message.reply_text("🗑 Set deleted." if ok else "❌ Set not found.")
+
+async def del_duplicate_compat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.effective_message.reply_text("⛔ Owner only."); return
+    conn=db_connect(); cur=conn.cursor()
+    cur.execute("SELECT id, data FROM quizzes ORDER BY id")
+    rows=cur.fetchall(); seen=set(); deleted=0
+    for r in rows:
+        qid=r[0]; data=r[1]
+        try:
+            questions=json.loads(data)
+        except Exception:
+            continue
+        sig=json.dumps(questions, sort_keys=True, ensure_ascii=False)
+        if sig in seen:
+            cur.execute("DELETE FROM quizzes WHERE id=?", (qid,)); deleted+=1
+        else:
+            seen.add(sig)
+    conn.commit(); conn.close()
+    await update.effective_message.reply_text(f"🧹 Duplicate cleanup complete: {deleted} duplicate quiz set(s) removed.")
+
+async def manage_compat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.effective_message.reply_text("⛔ Owner only."); return
+    await mystore_command(update, context)
+
+async def quiz_compat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /quiz from the second bot becomes the richer existing broadcast flow.
+    return await quizblast_entry(update, context)
+
+async def fc_compat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "📢 Channel forwarding is handled by /setchannel. Add the bot as channel admin, "
+        "then forward a message from the channel here.\n\nUse /mychannels to manage links."
+    )
+
+async def fg_compat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "👥 Group routing is handled by the tracked-group system. Add the bot to the target group; "
+        "then use Official Quiz /startquiz or /quizblast to post there."
+    )
+
+async def set_fc_compat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text("Use /setchannel for channel routing. The bot must be an admin in the target channel.")
+
+async def set_fg_compat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text("Add the bot to the target group and run /start or /sync; tracked groups are persisted automatically.")
+
+
+# ==========================================
+# 🏁 MAIN ENTRY POINT
+# ==========================================
+def main():
+    start_keepalive_server()
+
+    request_config = HTTPXRequest(
+        connect_timeout=60.0,
+        read_timeout=60.0,
+        write_timeout=60.0,
+        pool_timeout=60.0
+    )
+
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .request(request_config)
+        .get_updates_request(request_config)
+        .build()
+    )
+
+    app.add_error_handler(error_handler)
+
+    # --- Verification gate: runs before every /command except /start (group=-1,
+    # so it fires before the handler that would otherwise process the command) ---
+    app.add_handler(MessageHandler(filters.COMMAND, verification_command_gate), group=-1)
+
+    # --- Leave-detection: needs the bot to be an ADMIN in UPDATE_CHANNEL and
+    # UPDATE_GROUP to receive these membership updates at all ---
+    app.add_handler(ChatMemberHandler(handle_update_channel_group_membership, ChatMemberHandler.CHAT_MEMBER))
+
+    # --- Basic commands ---
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("create", create_command))
+    app.add_handler(CommandHandler("stoppoll", stoppoll_command))
+    app.add_handler(CommandHandler("pause", pause_command))
+    app.add_handler(CommandHandler("resume", resume_command))
+
+    # --- Compatibility commands merged from the second bot ---
+    app.add_handler(CommandHandler("newquiz", newquiz_compat))
+    app.add_handler(CommandHandler("my_quizzes", my_quizzes_compat))
+    app.add_handler(CommandHandler("settings", settings_compat))
+    app.add_handler(CommandHandler("todaylb", todaylb_compat))
+    app.add_handler(CommandHandler("stats", stats_compat))
+    app.add_handler(CommandHandler("sync", sync_compat))
+    app.add_handler(CommandHandler("restart", restart_compat))
+    app.add_handler(CommandHandler("backup", backup_compat))
+    app.add_handler(CommandHandler("del_quiz", del_quiz_compat))
+    app.add_handler(CommandHandler("del_set", del_set_compat))
+    app.add_handler(CommandHandler("del_duplicate", del_duplicate_compat))
+    app.add_handler(CommandHandler("manage", manage_compat))
+    app.add_handler(CommandHandler("quiz", quiz_compat))
+    app.add_handler(CommandHandler("fc", fc_compat))
+    app.add_handler(CommandHandler("fg", fg_compat))
+    app.add_handler(CommandHandler("set_fc", set_fc_compat))
+    app.add_handler(CommandHandler("set_fg", set_fg_compat))
+
+    # --- AI quiz generation conversation ---
+    ai_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("topic", topic_entry),
+            CommandHandler("pdf", pdf_entry),
+            CommandHandler("image", image_entry),
+            CommandHandler("youtube", youtube_entry),
+            CommandHandler("multi", multi_entry),
+            CommandHandler("section", section_entry),
+            CallbackQueryHandler(topic_button_entry, pattern="^create_topic$"),
+            CallbackQueryHandler(pdf_button_entry, pattern="^create_pdf$"),
+            CallbackQueryHandler(image_button_entry, pattern="^create_image$"),
+            CallbackQueryHandler(youtube_button_entry, pattern="^create_yt$"),
+            CallbackQueryHandler(multi_button_entry, pattern="^create_multi$"),
+        ],
+        states={
+            ASK_CONTENT: [
+                CommandHandler("done", receive_content),
+                CallbackQueryHandler(multi_done_button, pattern="^multi_done$"),
+                MessageHandler((filters.TEXT | filters.Document.ALL | filters.PHOTO) & ~filters.COMMAND, receive_content),
+            ],
+            ASK_DIFFICULTY: [CallbackQueryHandler(receive_difficulty, pattern="^diff_")],
+            ASK_LANGUAGE: [
+                CallbackQueryHandler(receive_language_button, pattern="^lang_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_language_text),
+            ],
+            ASK_COUNT: [CallbackQueryHandler(receive_count, pattern="^cnt_")],
+            ASK_SECTION_COUNT: [CallbackQueryHandler(receive_section_count, pattern="^sec_")],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_command),
+            CommandHandler("stop", cancel_command),
+            CallbackQueryHandler(cancel_callback, pattern="^gcancel$"),
+        ],
+        conversation_timeout=600,
+    )
+    app.add_handler(ai_conv)
+
+    # --- Voice → Quiz conversation ---
+    voice_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("voicequiz", voice_entry),
+            CallbackQueryHandler(voice_button_entry, pattern="^create_voice$"),
+        ],
+        states={
+            ASK_VOICE: [MessageHandler((filters.VOICE | filters.AUDIO) & ~filters.COMMAND, receive_voice)],
+            ASK_DIFFICULTY: [CallbackQueryHandler(receive_difficulty, pattern="^diff_")],
+            ASK_LANGUAGE: [
+                CallbackQueryHandler(receive_language_button, pattern="^lang_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_language_text),
+            ],
+            ASK_COUNT: [CallbackQueryHandler(receive_count, pattern="^cnt_")],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_command),
+            CommandHandler("stop", cancel_command),
+            CallbackQueryHandler(cancel_callback, pattern="^gcancel$"),
+        ],
+        conversation_timeout=600,
+    )
+    app.add_handler(voice_conv)
+
+    # --- Import from Channel/Group conversation (forward messages, no session needed) ---
+    import_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("importchat", import_entry),
+            CallbackQueryHandler(import_button_entry, pattern="^create_import$"),
+        ],
+        states={
+            IMPORT_COLLECT: [
+                CallbackQueryHandler(import_done_button, pattern="^import_done$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_import_text),
+            ],
+            IMPORT_KEYWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_import_keyword)],
+            ASK_DIFFICULTY: [CallbackQueryHandler(receive_difficulty, pattern="^diff_")],
+            ASK_LANGUAGE: [
+                CallbackQueryHandler(receive_language_button, pattern="^lang_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_language_text),
+            ],
+            ASK_COUNT: [CallbackQueryHandler(receive_count, pattern="^cnt_")],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_command),
+            CommandHandler("stop", cancel_command),
+            CallbackQueryHandler(cancel_callback, pattern="^gcancel$"),
+        ],
+        conversation_timeout=1200,
+    )
+    app.add_handler(import_conv)
+
+    # --- CSV conversation ---
+    csv_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("csv", csv_entry),
+            CallbackQueryHandler(csv_button_entry, pattern="^create_csv$"),
+        ],
+        states={
+            ASK_CSV: [MessageHandler(filters.Document.ALL & ~filters.COMMAND, receive_csv)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_command),
+            CommandHandler("stop", cancel_command),
+            CallbackQueryHandler(cancel_callback, pattern="^gcancel$"),
+        ],
+        conversation_timeout=600,
+    )
+    app.add_handler(csv_conv)
+
+    # --- Edit conversation ---
+    edit_conv = ConversationHandler(
+        entry_points=[CommandHandler("edit", edit_command)],
+        states={
+            ASK_EDIT_CHOICE: [CallbackQueryHandler(edit_pick, pattern="^editpick_")],
+            ASK_EDIT_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_apply)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_command),
+            CommandHandler("stop", cancel_command),
+            CallbackQueryHandler(cancel_callback, pattern="^gcancel$"),
+        ],
+        conversation_timeout=600,
+    )
+    app.add_handler(edit_conv)
+
+    # --- Bring-your-own-API-key conversation ---
+    api_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("addapi", addapi_entry),
+            CallbackQueryHandler(addapi_button_entry, pattern="^menu_apikey$"),
+        ],
+        states={
+            ASK_API_PROVIDER: [CallbackQueryHandler(receive_api_provider, pattern="^apiprov_")],
+            ASK_API_CUSTOM_BASE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_api_custom_base)],
+            ASK_API_CUSTOM_MODEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_api_custom_model)],
+            ASK_API_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_api_key)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_command),
+            CommandHandler("stop", cancel_command),
+            CallbackQueryHandler(cancel_callback, pattern="^gcancel$"),
+        ],
+        conversation_timeout=600,
+    )
+    app.add_handler(api_conv)
+    app.add_handler(CommandHandler("myapi", myapi_command))
+    app.add_handler(CommandHandler("removeapi", removeapi_command))
+
+    # --- Official Quiz Bot conversation (title → timer → forward/bulk → summary) ---
+    oq_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("officialquiz", officialquiz_entry),
+            CallbackQueryHandler(officialquiz_button_entry, pattern="^menu_official$"),
+        ],
+        states={
+            OQ_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, oq_receive_title)],
+            OQ_TIMER: [CallbackQueryHandler(oq_receive_timer, pattern="^oqt_")],
+            OQ_METHOD: [CallbackQueryHandler(oq_receive_method, pattern="^oqm_")],
+            OQ_COLLECT: [
+                CallbackQueryHandler(oq_forward_done, pattern="^oqdone_forward$"),
+                CallbackQueryHandler(oq_poll_correct_choice, pattern="^oqpollcorrect_"),
+                MessageHandler(filters.POLL, handle_forwarded_poll),
+            ],
+            OQ_BULK: [
+                CallbackQueryHandler(oq_bulk_done, pattern="^oqdone_bulk$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, oq_receive_bulk),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_command),
+            CommandHandler("stop", cancel_command),
+            CallbackQueryHandler(cancel_callback, pattern="^gcancel$"),
+        ],
+        conversation_timeout=1800,  # 30 min — enough headroom for a large (100s of polls) batch
+    )
+    app.add_handler(oq_conv)
+    app.add_handler(CommandHandler("startquiz", startquiz_command))
+    app.add_handler(CallbackQueryHandler(oqstart_callback, pattern="^oqstart_"))
+    app.add_handler(CallbackQueryHandler(oqshare_callback, pattern="^oqshare_"))
+    app.add_handler(CallbackQueryHandler(oq_control_callback, pattern="^oqctl_"))
+    # 🚪 Lobby / ready-check — group starts wait for 2+ players before firing questions
+    app.add_handler(CallbackQueryHandler(lobby_ready_callback, pattern="^oqready_"))
+    app.add_handler(CallbackQueryHandler(lobby_cancel_callback, pattern="^oqreadycancel_"))
+    app.add_handler(PollAnswerHandler(handle_poll_answer))
+
+    # --- Poll -> quiz conversion (stateless — outside the Official Quiz flow) ---
+    app.add_handler(MessageHandler(filters.POLL, handle_forwarded_poll))
+    app.add_handler(CallbackQueryHandler(handle_poll_correct_choice, pattern="^pollcorrect_"))
+
+    # --- Poll -> Text tool (stateless — forward polls, get one .txt back) ---
+    app.add_handler(CallbackQueryHandler(polltxt_start_callback, pattern="^polltxt_start$"))
+    app.add_handler(CallbackQueryHandler(polltxt_poll_correct_choice, pattern="^polltxtcorrect_"))
+    app.add_handler(CallbackQueryHandler(polltxt_done_callback, pattern="^polltxt_done$"))
+    app.add_handler(CallbackQueryHandler(polltxt_cancel_callback, pattern="^polltxt_cancel$"))
+
+    # --- Settings / quota / store ---
+    app.add_handler(CommandHandler("settag", settag_command))
+    app.add_handler(CommandHandler("setdescription", setdescription_command))
+    app.add_handler(CommandHandler("regenerate", regenerate_command))
+    app.add_handler(CommandHandler("redeem", redeem_command))
+    app.add_handler(CommandHandler("addcode", addcode_command))
+    app.add_handler(CommandHandler("topusers", topusers_command))
+    app.add_handler(CommandHandler("granttop10", granttop10_command))
+    app.add_handler(CommandHandler("broadcastcode", broadcastcode_command))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("backupnow", backupnow_command))
+    app.add_handler(CommandHandler("restorebackup", restorebackup_command))
+    app.add_handler(CommandHandler("mystore", mystore_command))
+    app.add_handler(CallbackQueryHandler(store_manage_callback, pattern="^stmanage_"))
+    app.add_handler(CallbackQueryHandler(store_list_page_callback, pattern="^stlist_"))
+    app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern="^noop$"))
+    app.add_handler(CallbackQueryHandler(store_delete_callback, pattern="^stdel_\\d"))
+    app.add_handler(CallbackQueryHandler(store_delete_confirm_callback, pattern="^stdelok_"))
+    app.add_handler(CallbackQueryHandler(store_toggle_public_callback, pattern="^stpub_\\d"))
+    app.add_handler(CallbackQueryHandler(store_dedup_callback, pattern="^stdedup_\\d"))
+    app.add_handler(CommandHandler("publicstore", publicstore_command))
+    app.add_handler(CallbackQueryHandler(public_store_page_callback, pattern="^publist_\\d"))
+    app.add_handler(CallbackQueryHandler(public_quiz_view_callback, pattern="^pubview_\\d"))
+    app.add_handler(CallbackQueryHandler(store_remove_question_list, pattern="^stremq_\\d"))
+    app.add_handler(CallbackQueryHandler(store_remove_question_confirm, pattern="^stremqok_"))
+    app.add_handler(CallbackQueryHandler(store_mytag_callback, pattern="^stmytag$"))
+    app.add_handler(CallbackQueryHandler(store_mydesc_callback, pattern="^stmydesc$"))
+    # 📊 Status — Official Quiz editing section: user_id + right/wrong/accuracy/speed per player
+    app.add_handler(CallbackQueryHandler(store_status_callback, pattern="^ststatus_"))
+    # 📁 File-in-Set / 📤 Send-to-Channel / 🔤 Option Style, launched from the manage view
+    app.add_handler(CallbackQueryHandler(store_set_pick_callback, pattern="^stsetpick_"))
+    app.add_handler(CallbackQueryHandler(store_set_assign_callback, pattern="^stsetdo_"))
+    app.add_handler(CallbackQueryHandler(store_send_channel_pick, pattern="^stsendch_"))
+    app.add_handler(CallbackQueryHandler(store_send_channel_do, pattern="^stsendchdo_"))
+    app.add_handler(CallbackQueryHandler(store_option_style_callback, pattern="^stoptstyle$"))
+
+    store_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(store_edit_title_start, pattern="^stedittitle_"),
+            CallbackQueryHandler(store_add_question_start, pattern="^staddq_"),
+            CallbackQueryHandler(store_edit_timer_start, pattern="^stedittimer_"),
+            CallbackQueryHandler(store_edit_desc_start, pattern="^steditdesc_"),
+        ],
+        states={
+            STORE_EDIT_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, store_edit_title_receive)],
+            STORE_ADD_QUESTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, store_add_question_receive)],
+            STORE_EDIT_TIMER: [
+                CallbackQueryHandler(store_edit_timer_pick, pattern="^sttimerpick_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, store_edit_timer_receive),
+            ],
+            STORE_EDIT_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, store_edit_desc_receive)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_command),
+            CommandHandler("stop", cancel_command),
+            CallbackQueryHandler(cancel_callback, pattern="^gcancel$"),
+        ],
+        conversation_timeout=600,
+    )
+    app.add_handler(store_conv)
+    app.add_handler(CommandHandler("default", default_command))
+    app.add_handler(CallbackQueryHandler(receive_default_diff, pattern="^setdef_diff_"))
+    app.add_handler(CommandHandler("schedule", schedule_command))
+    app.add_handler(CommandHandler("myschedules", myschedules_command))
+    app.add_handler(CallbackQueryHandler(schedule_cancel_callback, pattern="^schedcancel_\\d+$"))
+
+    # --- Personalization: option style, daily-limit exemptions, promo text ---
+    app.add_handler(CommandHandler("optionstyle", optionstyle_command))
+    app.add_handler(CallbackQueryHandler(optionstyle_callback, pattern="^optstyle_"))
+    app.add_handler(CommandHandler("freeuser", freeuser_command))
+    app.add_handler(CommandHandler("setpromo", setpromo_command))
+
+    # --- Quiz Sets (named folders) ---
+    app.add_handler(CommandHandler("newset", newset_command))
+    app.add_handler(CommandHandler("sets", sets_command))
+    app.add_handler(CallbackQueryHandler(set_view_callback, pattern="^setview_"))
+    app.add_handler(CallbackQueryHandler(set_list_back_callback, pattern="^setlist_back$"))
+    app.add_handler(CallbackQueryHandler(set_delete_callback, pattern="^setdel_"))
+
+    # --- Linked channels (for 📤 Send to Channel) ---
+    setchannel_conv = ConversationHandler(
+        entry_points=[CommandHandler("setchannel", setchannel_command)],
+        states={SETCHANNEL_WAIT: [MessageHandler(filters.ALL & ~filters.COMMAND, setchannel_receive)]},
+        fallbacks=[
+            CommandHandler("cancel", cancel_command),
+            CommandHandler("stop", cancel_command),
+            CallbackQueryHandler(cancel_callback, pattern="^gcancel$"),
+        ],
+        conversation_timeout=300,
+    )
+    app.add_handler(setchannel_conv)
+    app.add_handler(CommandHandler("mychannels", mychannels_command))
+    app.add_handler(CallbackQueryHandler(channel_remove_callback, pattern="^chrm_"))
+
+    # --- /add_bulk — paste text OR upload a .txt file to bulk-create a quiz ---
+    addbulk_conv = ConversationHandler(
+        entry_points=[CommandHandler("add_bulk", addbulk_entry)],
+        states={
+            ADD_BULK_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, addbulk_receive_title)],
+            ADD_BULK_CONTENT: [MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, addbulk_receive_content)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_command),
+            CommandHandler("stop", cancel_command),
+            CallbackQueryHandler(cancel_callback, pattern="^gcancel$"),
+        ],
+        conversation_timeout=900,
+    )
+    app.add_handler(addbulk_conv)
+
+    # --- Leaderboards (always show user_id) ---
+    app.add_handler(CommandHandler("leaderboard", leaderboard_command))
+    app.add_handler(CallbackQueryHandler(leaderboard_mode_callback, pattern="^lbmode_"))
+
+    # --- Owner: quiz blast (one question -> poll broadcast to every tracked group) ---
+    quizblast_conv = ConversationHandler(
+        entry_points=[CommandHandler("quizblast", quizblast_entry)],
+        states={ASK_QUIZBLAST_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, quizblast_receive)]},
+        fallbacks=[
+            CommandHandler("cancel", cancel_command),
+            CommandHandler("stop", cancel_command),
+            CallbackQueryHandler(cancel_callback, pattern="^gcancel$"),
+        ],
+        conversation_timeout=600,
+    )
+    app.add_handler(quizblast_conv)
+
+    # --- Group management ---
+    app.add_handler(CommandHandler("mute", mute_command))
+    app.add_handler(CommandHandler("unmute", unmute_command))
+    app.add_handler(CommandHandler("promote", promote_command))
+    app.add_handler(CommandHandler("demote", demote_command))
+    app.add_handler(CommandHandler("purge", purge_command))
+    app.add_handler(CommandHandler("info", info_command))
+    app.add_handler(CommandHandler("filter", filter_command))
+    app.add_handler(CommandHandler("removefilter", removefilter_command))
+    app.add_handler(CommandHandler("filters", filters_command))
+
+    # --- Welcome / goodbye ---
+    app.add_handler(CommandHandler("welcome", welcome_toggle_command))
+    app.add_handler(CommandHandler("setwelcome", setwelcome_command))
+    app.add_handler(CommandHandler("setgoodbye", setgoodbye_command))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, handle_new_chat_members))
+    app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, handle_left_chat_member))
+
+    # --- Menu navigation / verification (generic router — must stay LAST among callback handlers) ---
+    app.add_handler(CallbackQueryHandler(button_callback))
+
+    # --- Group keyword filters (separate group so it runs alongside conversations) ---
+    app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS & ~filters.COMMAND, check_filters), group=1)
+
+    # --- Remember every group the bot is in, so its group list survives a restart
+    # even though a live-quiz session's pause/resume state is in-memory only ---
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS, track_group_message, block=False), group=2)
+
+    # --- Self-backup: DM the owner a full DB dump every 6h (first one 2 min after
+    # startup) so data survives even if the DB service/host wipes or is switched ---
+    if app.job_queue:
+        app.job_queue.run_repeating(periodic_backup_job, interval=6 * 3600, first=120, name="db_auto_backup")
+
+    print(f"🤖 Bot Engine Started Successfully...\nStyle: {FONT_STYLE}")
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
+
+def run_forever():
+    """Wraps main() in a restart loop with backoff. app.run_polling() already retries
+    transient network errors internally (that's normal, not a crash), but if the
+    process itself dies for any other reason — an exception during startup, the host
+    briefly killing the process, etc. — this brings it straight back up instead of
+    staying down until something notices and restarts it by hand. Every crash is
+    logged with its full traceback first so the real cause is still visible."""
+    backoff = 5
+    while True:
+        try:
+            main()
+            # run_polling() only returns on a clean shutdown (e.g. Ctrl+C) — treat
+            # that as intentional and stop, rather than looping forever.
+            break
+        except Exception:
+            logger.error("Bot crashed — restarting shortly. Full traceback:", exc_info=True)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 300)  # cap the wait at 5 minutes
+
+
+if __name__ == "__main__":
+    run_forever()
