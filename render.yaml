@@ -15,7 +15,7 @@ services:
     region: oregon
     branch: main
     buildCommand: pip install -r requirements.txt
-    startCommand: python master_bot.py
+    startCommand: python bot.py
     healthCheckPath: /
     autoDeployTrigger: commit
     envVars:
