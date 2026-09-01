@@ -17,8 +17,5 @@ python-dotenv>=1.0.1
 # Anthropic (Claude) API client — one of the supported AI providers for MCQ generation.
 anthropic>=0.100.0
 
-# Used by /youtube to pull a video's transcript before generating MCQs from it.
-youtube-transcript-api>=0.6.2
-
 # Used by /pdf to extract text from uploaded PDFs.
 pypdf>=4.2.0
