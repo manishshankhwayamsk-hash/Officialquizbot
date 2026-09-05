@@ -7960,5 +7960,3 @@ def run_forever():
 
 if __name__ == "__main__":
     run_forever()
-import krx_addon
-krx_addon.setup(app, db_connect, PK_TYPE, OWNER_ID, logger)
