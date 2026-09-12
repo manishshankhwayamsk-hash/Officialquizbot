@@ -3171,7 +3171,7 @@ async def post_quiz_polls(bot, chat_id, questions: list, user_tag: str = '', exp
     for q in questions:
         question_text = q["question"]
         if user_tag:
-            question_text = f"{question_text}\n\n🏷 {user_tag}"
+            question_text = f"{question_text}\n\n {user_tag}"
         question_text = question_text[:300]
 
         explanation = q.get("explanation", "")
@@ -4264,7 +4264,7 @@ async def create_quiz_from_poll_data(bot, chat_id, question, options, correct_in
     clean_options = [_clean_poll_text(o) for o in options]
     question_text = clean_question
     if user_tag:
-        question_text = f"{question_text}\n\n🏷 {user_tag}"
+        question_text = f"{question_text}\n\n {user_tag}"
     explanation = f"💡 {explanation_tag}" if explanation_tag else None
     await bot.send_poll(
         chat_id=chat_id,
@@ -5045,7 +5045,7 @@ async def _run_live_quiz_loop(bot, application, chat_id):
             q = session['questions'][session['index']]
             question_text = f"Q{session['index'] + 1}. {q['question']}"
             if session.get('author_tag'):
-                question_text = f"{question_text} 🏷 {session['author_tag']}"
+                question_text = f"{question_text}  {session['author_tag']}"
             explanation = q.get('explanation', '')
             if session.get('author_desc_tag'):
                 explanation = f"{explanation}\n\n💡 {session['author_desc_tag']}".strip() if explanation else f"💡 {session['author_desc_tag']}"
@@ -5296,7 +5296,7 @@ async def settag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     tag = " ".join(context.args)[:60]
     set_user_field(update.effective_user.id, 'tag', tag)
-    await update.message.reply_text(f"🏷 Tag set: {tag}", reply_markup=back_to_tools_keyboard())
+    await update.message.reply_text(f" Tag set: {tag}", reply_markup=back_to_tools_keyboard())
 
 
 async def setdescription_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6207,7 +6207,7 @@ def _store_manage_view(quiz_id: int):
         [InlineKeyboardButton("📊 Status (who played, right/wrong)", callback_data=f"ststatus_{quiz_id}_0")],
         [InlineKeyboardButton("📤 Send to Channel", callback_data=f"stsendch_{quiz_id}")],
         [InlineKeyboardButton("🗑 Delete Quiz", callback_data=f"stdel_{quiz_id}")],
-        [InlineKeyboardButton("🏷 My Tag", callback_data="stmytag"),
+        [InlineKeyboardButton(" My Tag", callback_data="stmytag"),
          InlineKeyboardButton("💬 My Desc Tag", callback_data="stmydesc")],
         [InlineKeyboardButton("🔤 Option Style", callback_data="stoptstyle")],
         [InlineKeyboardButton("🔙 Back to My Quizzes", callback_data="menu_store")],
@@ -6657,7 +6657,7 @@ async def store_mytag_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     await context.bot.send_message(
         query.message.chat_id,
-        "🏷 Your tag is added to every quiz you post. Set it with:\n`/settag Your Tag Here`",
+        " Your tag is added to every quiz you post. Set it with:\n`/settag Your Tag Here`",
         parse_mode="Markdown",
     )
 
